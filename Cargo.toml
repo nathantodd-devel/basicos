@@ -1,0 +1,25 @@
+[package]
+name = "basicos"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "basicos"
+crate-type = ["staticlib"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1      # Better optimization (slower compile)
+opt-level = "z"        # Optimize for size
+strip = "symbols"      # Strip symbols from staticlib
+debug = false          # No debug info
+
+# Even smaller release build (use with `cargo build --profile release-small`)
+[profile.release-small]
+inherits = "release"
+opt-level = "z"
+lto = "fat"            # More aggressive LTO
