@@ -9,10 +9,14 @@
 //! - RDI, RSI, RDX, R10, R8, R9: arguments 1-6
 //! - RAX: return value (negative values indicate errors)
 
-use crate::sync::Spinlock;
-use crate::{fs, pr_debug, pr_info};
+#[cfg(feature = "storage")]
+use crate::{fs, sync::Spinlock};
+use crate::{pr_debug, pr_info};
+#[cfg(feature = "storage")]
 use alloc::format;
+#[cfg(feature = "storage")]
 use alloc::string::String;
+#[cfg(feature = "storage")]
 use alloc::vec::Vec;
 
 // ============================================================================
@@ -27,6 +31,11 @@ pub mod nr {
     pub const EXIT: u64 = 60;
     pub const GETPID: u64 = 39;
     pub const YIELD: u64 = 24; // sched_yield
+                               // Only meaningful with the `storage` feature (see `sys_open` etc.),
+                               // but these are just numbers — matching real syscall ABI numbers is
+                               // useful documentation even when the handler isn't compiled in, and
+                               // calling one with `storage` off just falls through to `dispatch`'s
+                               // "unknown syscall" arm (ENOSYS) rather than failing to compile.
     pub const LSEEK: u64 = 8;
     pub const GETDENTS64: u64 = 217; // matches Linux x86_64
 
@@ -92,12 +101,14 @@ const STDERR: u64 = 2;
 /// Which mounted filesystem a path refers to. There's no real VFS/mount
 /// table yet, so this is the whole namespace: `/initrd/...` (or exactly
 /// `/initrd`) means the initrd image, everything else means the disk.
+#[cfg(feature = "storage")]
 #[derive(Debug, Clone, Copy)]
 enum FsTarget {
     Disk,
     Initrd,
 }
 
+#[cfg(feature = "storage")]
 fn with_fs<R>(target: FsTarget, f: impl FnOnce(&mut fs::Fat32Fs) -> R) -> Option<R> {
     match target {
         FsTarget::Disk => fs::with_disk(f),
@@ -107,6 +118,7 @@ fn with_fs<R>(target: FsTarget, f: impl FnOnce(&mut fs::Fat32Fs) -> R) -> Option
 
 /// Split a syscall path into which filesystem it targets and the
 /// remaining path within that filesystem (no leading `/`).
+#[cfg(feature = "storage")]
 fn split_target(path: &str) -> (FsTarget, String) {
     let trimmed = path.trim_start_matches('/');
     if trimmed == "initrd" {
@@ -123,6 +135,7 @@ fn split_target(path: &str) -> (FsTarget, String) {
 /// `close()` (write-back, if anything was written) — there's no
 /// incremental on-disk update, which keeps `sys_write` from having to
 /// know anything about clusters.
+#[cfg(feature = "storage")]
 enum OpenFile {
     File {
         target: FsTarget,
@@ -137,18 +150,23 @@ enum OpenFile {
     },
 }
 
+#[cfg(feature = "storage")]
 const MAX_OPEN_FILES: usize = 16;
 /// fds 0-2 are stdin/stdout/stderr; real files start here.
+#[cfg(feature = "storage")]
 const FD_BASE: u64 = 3;
 
+#[cfg(feature = "storage")]
 static OPEN_FILES: Spinlock<[Option<OpenFile>; MAX_OPEN_FILES]> =
     Spinlock::new([const { None }; MAX_OPEN_FILES]);
 
+#[cfg(feature = "storage")]
 fn fd_index(fd: u64) -> Option<usize> {
     let idx = fd.checked_sub(FD_BASE)? as usize;
     (idx < MAX_OPEN_FILES).then_some(idx)
 }
 
+#[cfg(feature = "storage")]
 fn alloc_fd(file: OpenFile) -> Option<u64> {
     let mut table = OPEN_FILES.lock();
     let (idx, slot) = table.iter_mut().enumerate().find(|(_, s)| s.is_none())?;
@@ -161,6 +179,7 @@ fn alloc_fd(file: OpenFile) -> Option<u64> {
 /// Same trust level as the rest of this syscall layer (see `sys_write`):
 /// no page-table validation, just a bounded scan. Fine for a single
 /// trusted test program; not fine for an untrusted one.
+#[cfg(feature = "storage")]
 fn read_user_cstring(ptr: u64) -> Option<String> {
     if ptr == 0 {
         return None;
@@ -196,14 +215,19 @@ pub extern "C" fn dispatch(
     match number {
         nr::READ => sys_read(arg1, arg2, arg3),
         nr::WRITE => sys_write(arg1, arg2, arg3),
+        #[cfg(feature = "storage")]
         nr::OPEN => sys_open(arg1, arg2, arg3),
+        #[cfg(feature = "storage")]
         nr::CLOSE => sys_close(arg1),
         nr::EXIT => sys_exit(arg1 as i32),
         nr::GETPID => sys_getpid(),
         nr::YIELD => sys_yield(),
+        #[cfg(feature = "storage")]
         nr::LSEEK => sys_lseek(arg1, arg2, arg3),
+        #[cfg(feature = "storage")]
         nr::GETDENTS64 => sys_getdents64(arg1, arg2, arg3),
         nr::KLOG => sys_klog(arg1, arg2),
+        #[cfg(feature = "storage")]
         nr::TREE => sys_tree(arg1),
         _ => {
             pr_debug!("Unknown syscall: {}", number);
@@ -225,6 +249,7 @@ fn sys_read(fd: u64, buf: u64, count: u64) -> i64 {
             0 // EOF for now
         }
         STDOUT | STDERR => errno::EBADF, // write-only
+        #[cfg(feature = "storage")]
         _ => {
             let Some(idx) = fd_index(fd) else {
                 return errno::EBADF;
@@ -249,6 +274,8 @@ fn sys_read(fd: u64, buf: u64, count: u64) -> i64 {
                 None => errno::EBADF,
             }
         }
+        #[cfg(not(feature = "storage"))]
+        _ => errno::EBADF, // no file table without `storage`
     }
 }
 
@@ -282,6 +309,7 @@ fn sys_write(fd: u64, buf: u64, count: u64) -> i64 {
                 count as i64
             }
         }
+        #[cfg(feature = "storage")]
         _ => {
             let Some(idx) = fd_index(fd) else {
                 return errno::EBADF;
@@ -294,7 +322,9 @@ fn sys_write(fd: u64, buf: u64, count: u64) -> i64 {
             let src = unsafe { core::slice::from_raw_parts(buf as *const u8, count as usize) };
             let mut table = OPEN_FILES.lock();
             match table[idx].as_mut() {
-                Some(OpenFile::File { data, pos, dirty, .. }) => {
+                Some(OpenFile::File {
+                    data, pos, dirty, ..
+                }) => {
                     let end = *pos + src.len();
                     if data.len() < end {
                         data.resize(end, 0);
@@ -308,6 +338,8 @@ fn sys_write(fd: u64, buf: u64, count: u64) -> i64 {
                 None => errno::EBADF,
             }
         }
+        #[cfg(not(feature = "storage"))]
+        _ => errno::EBADF, // no file table without `storage`
     }
 }
 
@@ -315,6 +347,7 @@ fn sys_write(fd: u64, buf: u64, count: u64) -> i64 {
 /// directory on one of the mounted FAT32 filesystems, returning a new
 /// fd. `path` is resolved by `split_target`: `/initrd/...` for the
 /// initrd, anything else for the disk.
+#[cfg(feature = "storage")]
 fn sys_open(path_ptr: u64, flags: u64, _mode: u64) -> i64 {
     use open_flags::*;
 
@@ -371,6 +404,7 @@ fn sys_open(path_ptr: u64, flags: u64, _mode: u64) -> i64 {
 }
 
 /// close(fd) - Close a file descriptor, flushing any writes to disk.
+#[cfg(feature = "storage")]
 fn sys_close(fd: u64) -> i64 {
     let Some(idx) = fd_index(fd) else {
         return errno::EBADF;
@@ -402,6 +436,7 @@ fn sys_close(fd: u64) -> i64 {
 /// `offset` is reinterpreted as signed (matches the Linux ABI, where
 /// it's `off_t`); `whence` is one of `whence::{SEEK_SET,SEEK_CUR,SEEK_END}`.
 /// Returns the resulting offset, or a negative errno.
+#[cfg(feature = "storage")]
 fn sys_lseek(fd: u64, offset: u64, whence: u64) -> i64 {
     let Some(idx) = fd_index(fd) else {
         return errno::EBADF;
@@ -445,6 +480,7 @@ fn sys_lseek(fd: u64, offset: u64, whence: u64) -> i64 {
 /// Fills as many entries as fit in `count` bytes and returns the byte
 /// count written (0 once the directory is exhausted), advancing the
 /// fd's position — callers loop until it returns 0, same as Linux.
+#[cfg(feature = "storage")]
 fn sys_getdents64(fd: u64, dirp: u64, count: u64) -> i64 {
     const HEADER_LEN: usize = 19; // d_ino(8) + d_off(8) + d_reclen(2) + d_type(1)
     const DT_DIR: u8 = 4;
@@ -547,6 +583,7 @@ fn sys_klog(buf: u64, len: u64) -> i64 {
 /// Ring 3 can't walk the filesystem itself — no port I/O, no access to
 /// the kernel heap or the `fs::Fat32Fs` handle — so this does the whole
 /// walk in kernel mode and just reports success/failure back to userspace.
+#[cfg(feature = "storage")]
 fn sys_tree(target: u64) -> i64 {
     let (label, result) = match target {
         tree_target::DISK => ("disk", fs::with_disk(|f| print_tree(f, "/", 0))),
@@ -568,6 +605,7 @@ fn sys_tree(target: u64) -> i64 {
 
 /// Recursively print `path`'s contents (indented by `depth`) to the
 /// kernel log, descending into subdirectories.
+#[cfg(feature = "storage")]
 fn print_tree(fs: &mut fs::Fat32Fs, path: &str, depth: usize) -> Result<(), fs::Fat32Error> {
     if depth == 0 {
         pr_info!("[user] /");

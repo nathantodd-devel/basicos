@@ -7,25 +7,32 @@
 #![no_main]
 #![feature(abi_x86_interrupt)]
 
+#[cfg(feature = "heap")]
 extern crate alloc;
 
 use core::panic::PanicInfo;
 
 mod arch;
 mod drivers;
+#[cfg(feature = "storage")]
 mod fs;
 mod log;
 mod mem;
 mod sync;
+#[cfg(feature = "usermode-demo")]
 mod syscall;
+#[cfg(feature = "usermode-demo")]
 mod usermode;
 
 // Re-export commonly used items
 pub use log::{LogLevel, RateLimiter};
+#[cfg(feature = "usermode-demo")]
 pub use syscall::nr as syscall_nr;
 
 // Convenient aliases for internal use
-use arch::{cpu_info, gdt, interrupts, x86_64::syscall as arch_syscall};
+use arch::{cpu_info, gdt, interrupts};
+#[cfg(feature = "usermode-demo")]
+use arch::x86_64::syscall as arch_syscall;
 use drivers::{serial, vga};
 
 /// Entry point called from assembly.
@@ -59,58 +66,77 @@ pub extern "C" fn kernel_main(magic: u64, mb_info_addr: u64) -> ! {
         memory_map.total_available() / (1024 * 1024)
     );
 
-    // Initialize frame allocator
-    mem::frame::init(&memory_map);
-    pr_info!(
-        "Frame allocator: {}/{} frames free ({} MiB)",
-        mem::frame::free_count(),
-        mem::frame::total_frames(),
-        mem::frame::free_count() * 4 / 1024
-    );
+    // Initialize the physical frame allocator
+    #[cfg(feature = "frame-alloc")]
+    {
+        mem::frame::init(&memory_map);
+        pr_info!(
+            "Frame allocator: {}/{} frames free ({} MiB)",
+            mem::frame::free_count(),
+            mem::frame::total_frames(),
+            mem::frame::free_count() * 4 / 1024
+        );
+    }
 
     // Look for a bootloader module (GRUB `module2` — our initrd) and
     // reserve its frames *before* paging or anything else gets a chance
     // to hand them out to something else. We don't read its contents
     // yet; that happens later, once the heap is up.
+    #[cfg(feature = "storage")]
     let initrd_module = unsafe { mem::multiboot2::find_first_module(mb_info_addr) };
+    #[cfg(feature = "storage")]
     if let Some(module) = &initrd_module {
         mem::frame::reserve_range(module.start as usize, module.end as usize);
     }
 
     // Initialize paging system
-    mem::paging::init();
-    pr_info!("Paging initialized");
+    #[cfg(feature = "paging")]
+    {
+        mem::paging::init();
+        pr_info!("Paging initialized");
+    }
 
     unsafe { gdt::init() };
     pr_info!("GDT + TSS loaded");
 
-    mem::heap::init();
-    pr_info!(
-        "Heap allocator initialized ({} KiB)",
-        mem::heap::HEAP_SIZE / 1024
-    );
+    #[cfg(feature = "heap")]
+    {
+        mem::heap::init();
+        pr_info!(
+            "Heap allocator initialized ({} KiB)",
+            mem::heap::HEAP_SIZE / 1024
+        );
+    }
 
     // Mount storage: the primary ATA disk (if present) and the initrd
     // (if GRUB loaded one). Both are FAT32 — see `fs::fat32`.
-    match fs::init_disk() {
-        Ok(()) => pr_info!("Disk: mounted FAT32 volume on primary ATA drive"),
-        Err(e) => pr_warn!("Disk: {}", e),
-    }
-    match initrd_module {
-        Some(module) => {
-            // Safety: reserved in the frame allocator above, before
-            // paging or anything else could have claimed these frames.
-            let bytes = unsafe { module.as_slice() };
-            match fs::init_initrd(bytes) {
-                Ok(()) => pr_info!("initrd: mounted FAT32 image ({} KiB)", bytes.len() / 1024),
-                Err(e) => pr_warn!("initrd: {}", e),
-            }
+    #[cfg(feature = "storage")]
+    {
+        match fs::init_disk() {
+            Ok(()) => pr_info!("Disk: mounted FAT32 volume on primary ATA drive"),
+            Err(e) => pr_warn!("Disk: {}", e),
         }
-        None => pr_info!("initrd: no module supplied by bootloader"),
+        match initrd_module {
+            Some(module) => {
+                // Safety: reserved in the frame allocator above, before
+                // paging or anything else could have claimed these frames.
+                let bytes = unsafe { module.as_slice() };
+                match fs::init_initrd(bytes) {
+                    Ok(()) => {
+                        pr_info!("initrd: mounted FAT32 image ({} KiB)", bytes.len() / 1024)
+                    }
+                    Err(e) => pr_warn!("initrd: {}", e),
+                }
+            }
+            None => pr_info!("initrd: no module supplied by bootloader"),
+        }
     }
 
-    unsafe { arch_syscall::init() };
-    pr_info!("SYSCALL/SYSRET initialized");
+    #[cfg(feature = "usermode-demo")]
+    {
+        unsafe { arch_syscall::init() };
+        pr_info!("SYSCALL/SYSRET initialized");
+    }
 
     interrupts::init();
     pr_info!("Interrupts enabled");
@@ -120,16 +146,31 @@ pub extern "C" fn kernel_main(magic: u64, mb_info_addr: u64) -> ! {
     let brand = cpu_info::get_cpu_brand();
     pr_info!("CPU: {} - {}", vendor.as_str(), brand.as_str());
 
-    pr_notice!("Jumping to ring 3...");
-    let stack_top = unsafe { core::ptr::addr_of!(USER_STACK.0) as u64 + USER_STACK_SIZE as u64 };
-    unsafe { gdt::jump_to_ring3(usermode::user_mode_stub, stack_top) }
+    #[cfg(feature = "usermode-demo")]
+    {
+        pr_notice!("Jumping to ring 3...");
+        let stack_top =
+            unsafe { core::ptr::addr_of!(USER_STACK.0) as u64 + USER_STACK_SIZE as u64 };
+        unsafe { gdt::jump_to_ring3(usermode::user_mode_stub, stack_top) }
+    }
+
+    #[cfg(not(feature = "usermode-demo"))]
+    {
+        pr_notice!("Boot sequence complete (usermode-demo disabled) — halting.");
+        loop {
+            unsafe { core::arch::asm!("cli", "hlt") };
+        }
+    }
 }
 
+#[cfg(feature = "usermode-demo")]
 const USER_STACK_SIZE: usize = 4 * 1024; // 4 KiB user stack
 
+#[cfg(feature = "usermode-demo")]
 #[repr(align(16))]
 struct UserStack([u8; USER_STACK_SIZE]);
 
+#[cfg(feature = "usermode-demo")]
 static mut USER_STACK: UserStack = UserStack([0; USER_STACK_SIZE]);
 
 #[panic_handler]

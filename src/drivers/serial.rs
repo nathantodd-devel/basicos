@@ -4,8 +4,10 @@
 //! `qemu-system-x86_64 ... -serial stdio` or real hardware.
 
 use crate::arch::port::{inb, outb};
+#[cfg(feature = "serial-input")]
 use crate::sync::RingBuffer;
 use core::fmt::{self, Write};
+#[cfg(feature = "serial-input")]
 use core::sync::atomic::{AtomicBool, Ordering};
 
 // COM1 port addresses
@@ -22,21 +24,26 @@ const COM1_DLL: u16 = COM1_BASE; // Divisor Latch Low (when DLAB=1)
 const COM1_DLH: u16 = COM1_BASE + 1; // Divisor Latch High (when DLAB=1)
 
 // IER bits
+#[cfg(feature = "serial-input")]
 const IER_RX_AVAILABLE: u8 = 0x01; // Enable Received Data Available interrupt
 #[allow(dead_code)]
 const IER_TX_EMPTY: u8 = 0x02; // Enable Transmitter Holding Register Empty interrupt
 
 // LSR bits
+#[cfg(feature = "serial-input")]
 const LSR_DATA_READY: u8 = 0x01; // Data ready to read
 const LSR_TX_EMPTY: u8 = 0x20; // Transmit buffer empty
 
 /// Size of the receive buffer in bytes.
+#[cfg(feature = "serial-input")]
 const RX_BUFFER_SIZE: usize = 256;
 
 /// Receive buffer for incoming serial data.
+#[cfg(feature = "serial-input")]
 static RX_BUFFER: RingBuffer<u8, RX_BUFFER_SIZE> = RingBuffer::new();
 
 /// Flag indicating data is available in the receive buffer.
+#[cfg(feature = "serial-input")]
 static DATA_AVAILABLE: AtomicBool = AtomicBool::new(false);
 
 /// Initialize COM1 serial port at 115200 baud, 8N1 with receive interrupts.
@@ -64,7 +71,9 @@ pub unsafe fn init() {
     // Enable DTR, RTS, and OUT2 (OUT2 is required for interrupts on PC)
     outb(COM1_MCR, 0x0B);
 
-    // Enable receive data available interrupt
+    // Enable the receive-data-available interrupt only if we actually
+    // read input; otherwise leave IER cleared (output-only, as above).
+    #[cfg(feature = "serial-input")]
     outb(COM1_IER, IER_RX_AVAILABLE);
 }
 
@@ -75,6 +84,7 @@ fn is_transmit_empty() -> bool {
 }
 
 /// Check if data is ready to be read.
+#[cfg(feature = "serial-input")]
 #[inline]
 fn is_data_ready() -> bool {
     unsafe { inb(COM1_LSR) & LSR_DATA_READY != 0 }
@@ -106,6 +116,7 @@ pub fn write_str(s: &str) {
 
 /// Called by the serial IRQ handler when data is received.
 /// Reads all available bytes into the receive buffer.
+#[cfg(feature = "serial-input")]
 pub fn on_interrupt() {
     while is_data_ready() {
         let byte = unsafe { inb(COM1_DATA) };
@@ -117,6 +128,7 @@ pub fn on_interrupt() {
 
 /// Read a byte from the receive buffer if available.
 /// Returns `None` if the buffer is empty.
+#[cfg(feature = "serial-input")]
 pub fn try_read_byte() -> Option<u8> {
     let byte = RX_BUFFER.try_pop();
     if RX_BUFFER.is_empty() {
@@ -126,6 +138,7 @@ pub fn try_read_byte() -> Option<u8> {
 }
 
 /// Read a byte from the receive buffer, blocking until data is available.
+#[cfg(feature = "serial-input")]
 pub fn read_byte() -> u8 {
     loop {
         if let Some(byte) = try_read_byte() {
@@ -137,6 +150,7 @@ pub fn read_byte() -> u8 {
 }
 
 /// Check if there is data available to read.
+#[cfg(feature = "serial-input")]
 pub fn has_data() -> bool {
     DATA_AVAILABLE.load(Ordering::Acquire)
 }
@@ -144,6 +158,7 @@ pub fn has_data() -> bool {
 /// Read a line (up to newline or buffer capacity) into the provided buffer.
 /// Returns the number of bytes read (not including the newline).
 /// Echoes characters back to the serial port.
+#[cfg(feature = "serial-input")]
 pub fn read_line(buf: &mut [u8]) -> usize {
     let mut i = 0;
     while i < buf.len() {
@@ -186,6 +201,7 @@ pub fn read_line(buf: &mut [u8]) -> usize {
 
 /// Read bytes directly from the serial port without using the buffer.
 /// Useful for polling mode when interrupts are disabled.
+#[cfg(feature = "serial-input")]
 pub fn poll_read_byte() -> Option<u8> {
     if is_data_ready() {
         Some(unsafe { inb(COM1_DATA) })

@@ -6,7 +6,10 @@
 //! - `paging`: Page table manipulation and virtual memory management
 //! - `heap`: Kernel heap allocator (`#[global_allocator]`)
 
+#[cfg(feature = "frame-alloc")]
 pub mod frame;
+#[cfg(feature = "heap")]
 pub mod heap;
 pub mod multiboot2;
+#[cfg(feature = "paging")]
 pub mod paging;

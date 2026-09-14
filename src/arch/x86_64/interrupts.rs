@@ -1,7 +1,13 @@
 //! Exception handlers, IRQ handlers, and interrupt subsystem init.
 
-use super::{idt, pic, pit, port};
-use crate::{pr_crit, pr_err, pr_info, pr_warn};
+#[cfg(feature = "pit-100hz")]
+use super::pit;
+#[cfg(feature = "keyboard")]
+use super::port;
+use super::{idt, pic};
+#[cfg(feature = "pit-100hz")]
+use crate::pr_info;
+use crate::{pr_crit, pr_err, pr_warn};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Pushed onto the stack by the CPU before it invokes our handler.
@@ -17,9 +23,17 @@ pub struct InterruptStackFrame {
 
 pub static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 
-/// PIT tick rate. `log.rs` assumes this when converting `TIMER_TICKS` to
-/// a timestamp, so keep the two in sync if this ever changes.
+/// PIT tick rate. `log.rs` uses this to convert `TIMER_TICKS` into a
+/// timestamp, so keep the two in sync if this ever changes.
+///
+/// 100 Hz when we've reprogrammed the PIT (`pit-100hz` feature); left at
+/// the hardware's power-on default otherwise (truncated to a whole
+/// number — the real rate is ~18.2 Hz, so timestamps are coarser and
+/// very slightly off, but still correctly scaled).
+#[cfg(feature = "pit-100hz")]
 pub const TIMER_HZ: u32 = 100;
+#[cfg(not(feature = "pit-100hz"))]
+pub const TIMER_HZ: u32 = 18;
 
 // --- CPU exceptions (vectors 0-31) --------------------------------------
 
@@ -237,12 +251,14 @@ extern "x86-interrupt" fn timer_interrupt_handler(_frame: InterruptStackFrame) {
     unsafe { pic::send_eoi(0) };
 }
 
+#[cfg(feature = "keyboard")]
 extern "x86-interrupt" fn keyboard_interrupt_handler(_frame: InterruptStackFrame) {
     let scancode = unsafe { port::inb(0x60) };
     crate::drivers::keyboard::on_scancode(scancode);
     unsafe { pic::send_eoi(1) };
 }
 
+#[cfg(feature = "serial-input")]
 extern "x86-interrupt" fn serial_interrupt_handler(_frame: InterruptStackFrame) {
     crate::drivers::serial::on_interrupt();
     unsafe { pic::send_eoi(4) };
@@ -382,7 +398,9 @@ pub fn init() {
 
         // Hardware IRQs
         idt::set_handler(VEC_TIMER, handler_addr!(timer_interrupt_handler));
+        #[cfg(feature = "keyboard")]
         idt::set_handler(VEC_KEYBOARD, handler_addr!(keyboard_interrupt_handler));
+        #[cfg(feature = "serial-input")]
         idt::set_handler(VEC_COM1, handler_addr!(serial_interrupt_handler));
         idt::set_handler(VEC_SPURIOUS7, handler_addr!(spurious_irq7_handler));
         idt::set_handler(VEC_ATA_SECONDARY, handler_addr!(spurious_irq15_handler));
@@ -390,14 +408,27 @@ pub fn init() {
         idt::load();
 
         pic::remap(0x20, 0x28);
-        // Enable: IRQ0 (timer), IRQ1 (keyboard), IRQ4 (COM1)
-        // Mask bits: 1 = disabled, 0 = enabled
-        // Master: 0b1110_1100 = mask all except 0, 1, 4
-        // Slave: 0xFF = mask all
-        pic::set_masks(0b1110_1100, 0xFF);
 
-        pit::set_frequency(TIMER_HZ);
-        pr_info!("PIT: reprogrammed channel 0 to {} Hz", TIMER_HZ);
+        // Mask bits: 1 = disabled, 0 = enabled. IRQ0 (timer) is always
+        // on; IRQ1/IRQ4 only if their driver is actually compiled in —
+        // otherwise we'd take an interrupt with no handler installed
+        // for it (unmapped IDT entry -> #GP -> halt_loop).
+        let mut master_mask: u8 = 0b1111_1110; // unmask IRQ0
+        #[cfg(feature = "keyboard")]
+        {
+            master_mask &= !(1 << 1); // unmask IRQ1
+        }
+        #[cfg(feature = "serial-input")]
+        {
+            master_mask &= !(1 << 4); // unmask IRQ4
+        }
+        pic::set_masks(master_mask, 0xFF);
+
+        #[cfg(feature = "pit-100hz")]
+        {
+            pit::set_frequency(TIMER_HZ);
+            pr_info!("PIT: reprogrammed channel 0 to {} Hz", TIMER_HZ);
+        }
 
         core::arch::asm!("sti");
     }

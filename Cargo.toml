@@ -7,6 +7,70 @@ edition = "2021"
 name = "basicos"
 crate-type = ["staticlib"]
 
+[features]
+# Every optional subsystem is on by default — `cargo build` (or plain
+# `make`) gets the full kernel. Pick a subset with, e.g.:
+#   cargo build --no-default-features --features heap,keyboard
+# or override the Makefile's FEATURES variable (`make FEATURES=...`).
+default = [
+    "heap",
+    "frame-alloc",
+    "paging",
+    "storage",
+    "keyboard",
+    "serial-input",
+    "pit-100hz",
+    "apic",
+    "usermode-demo",
+]
+
+# Heap allocator (`#[global_allocator]`, `mem::heap`) — pulls in `alloc`.
+# Anything that needs `Vec`/`String`/`Box` (namely `storage`) needs this.
+heap = []
+
+# Physical frame allocator (`mem::frame`). Needed by `paging`, and by
+# `storage` to reserve the initrd module's memory before use.
+frame-alloc = []
+
+# Virtual memory manager (`mem::paging`) on top of the frame allocator —
+# map/unmap/translate beyond the boot-time identity map `entrypoint.s`
+# already sets up (that part isn't gated; it's assembly, not Cargo).
+paging = ["frame-alloc"]
+
+# ATA (PIO) disk driver + FAT32 + initrd, and the syscalls that use them
+# (open/close/lseek/getdents64, the file-backed paths of read/write, and
+# the basicos-specific `tree` syscall). Needs `alloc` for FAT32's
+# in-memory buffers and `frame-alloc` to reserve the initrd's memory.
+storage = ["heap", "frame-alloc"]
+
+# PS/2 keyboard driver: scancode decoding, modifier tracking, the input
+# ring buffer, and IRQ1 wiring. Off = IRQ1 stays masked at the PIC, so
+# keypresses are silently ignored instead of hitting an unhandled vector.
+keyboard = []
+
+# Serial (COM1) *input* — the RX ring buffer, IRQ4 handler, and
+# read_byte/read_line/etc. Serial *output* (used for kernel logging) is
+# always available regardless of this feature.
+serial-input = []
+
+# Reprogram the PIT to 100 Hz on boot for ~10ms-resolution log
+# timestamps. Off = the PIT stays at its power-on default (~18.2 Hz),
+# and log timestamps are computed against that instead (coarser, but
+# still correctly scaled).
+pit-100hz = []
+
+# Local APIC driver (`arch::x86_64::apic`): timer calibration, IPIs, and
+# so on. Not wired into the boot sequence either way — legacy PIC mode
+# (`pic.rs`) is what actually drives interrupts today — so this exists
+# as available infrastructure for whoever picks up SMP/APIC-timer work.
+apic = []
+
+# The ring-3 jump: SYSCALL/SYSRET MSR setup, the syscall dispatch table,
+# and `usermode::user_mode_stub`, which exercises it (including a
+# storage demo, if `storage` is also enabled). Off = kernel_main sets
+# everything up and then just halts, no ring-3 code ever runs.
+usermode-demo = []
+
 [profile.dev]
 panic = "abort"
 

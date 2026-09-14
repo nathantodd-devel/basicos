@@ -12,6 +12,11 @@
 #   make reset-disks  - disk-reset + initrd-reset
 #   make clean        - remove build artifacts
 #   make size         - show kernel binary sizes
+#
+# Every optional subsystem (heap, paging, storage, keyboard, ...) is a
+# Cargo feature, on by default. Build a reduced kernel with FEATURES:
+#   make FEATURES="--no-default-features --features heap,keyboard"
+# See [features] in Cargo.toml for the full list and what each gates.
 
 ARCH        := x86_64
 TARGET_SPEC := x86_64-basicos
@@ -27,6 +32,11 @@ QEMU        := qemu-system-x86_64
 QEMU_IMG    := qemu-img
 MKFS_VFAT   := mkfs.vfat
 MCOPY       := mcopy
+
+# Cargo feature flags, e.g. `--no-default-features --features heap`.
+# Empty (the default) means "use Cargo.toml's default features" — i.e.
+# everything.
+FEATURES    :=
 
 # Debug build paths
 DEBUG_LIB   := target/$(TARGET_SPEC)/debug/libbasicos.a
@@ -59,9 +69,15 @@ INITRD_SIZE := 8M
 QEMU_FLAGS  := -m 256M -serial stdio -boot d -drive file=$(DISK_IMG),format=raw,if=ide,index=0
 
 .PHONY: all debug release kernel kernel-release iso iso-release run run-release \
-        disk disk-reset initrd initrd-reset reset-disks clean size
+        disk disk-reset initrd initrd-reset reset-disks clean size FORCE
 
 all: iso
+
+# Always-out-of-date prerequisite: forces the cargo-build rules below to
+# actually invoke cargo every time, since file-mtime tracking alone
+# wouldn't notice a `make FEATURES=...` override with no source changes
+# (cargo's own fingerprinting is what makes repeat builds fast, not this).
+FORCE:
 
 debug: iso
 
@@ -81,8 +97,8 @@ $(ASM_OBJ): entrypoint.s | $(BUILD_DIR)
 # Debug Build
 # ============================================================================
 
-$(DEBUG_LIB): $(RUST_SOURCES) Cargo.toml $(TARGET_SPEC).json .cargo/config.toml
-	$(CARGO) -Zjson-target-spec build
+$(DEBUG_LIB): $(RUST_SOURCES) Cargo.toml $(TARGET_SPEC).json .cargo/config.toml FORCE
+	$(CARGO) -Zjson-target-spec build $(FEATURES)
 
 kernel: $(ASM_OBJ) $(DEBUG_LIB) linker.ld
 	$(LD) -n -T linker.ld -o $(DEBUG_BIN) $(ASM_OBJ) $(DEBUG_LIB)
@@ -98,8 +114,8 @@ iso: kernel initrd
 # Release Build (optimized + stripped)
 # ============================================================================
 
-$(RELEASE_LIB): $(RUST_SOURCES) Cargo.toml $(TARGET_SPEC).json .cargo/config.toml
-	$(CARGO) -Zjson-target-spec build --release
+$(RELEASE_LIB): $(RUST_SOURCES) Cargo.toml $(TARGET_SPEC).json .cargo/config.toml FORCE
+	$(CARGO) -Zjson-target-spec build --release $(FEATURES)
 
 kernel-release: $(ASM_OBJ) $(RELEASE_LIB) linker.ld
 	$(LD) -n -T linker.ld -o $(RELEASE_BIN) $(ASM_OBJ) $(RELEASE_LIB)

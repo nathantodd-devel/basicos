@@ -110,40 +110,24 @@ unsafe fn wrmsr(msr: u32, value: u64) {
 }
 
 /// Check if the CPU supports APIC (via CPUID).
+///
+/// Uses the `__cpuid` intrinsic rather than a hand-rolled `asm!` block —
+/// LLVM reserves RBX for its own use and refuses `out("ebx")` in inline
+/// asm, so a raw CPUID leaf 1 query needs the same save/restore dance
+/// `__cpuid` already does internally (see `cpu_info.rs`, which uses it
+/// for exactly this reason).
 pub fn is_apic_available() -> bool {
-    let result: u32;
-    unsafe {
-        core::arch::asm!(
-            "mov eax, 1",
-            "cpuid",
-            out("edx") result,
-            out("eax") _,
-            out("ebx") _,
-            out("ecx") _,
-            options(nomem, nostack)
-        );
-    }
+    let result = core::arch::x86_64::__cpuid(1);
     // Bit 9 of EDX indicates APIC availability
-    result & (1 << 9) != 0
+    result.edx & (1 << 9) != 0
 }
 
 /// Check if the CPU supports x2APIC mode.
 #[allow(dead_code)]
 pub fn is_x2apic_available() -> bool {
-    let result: u32;
-    unsafe {
-        core::arch::asm!(
-            "mov eax, 1",
-            "cpuid",
-            out("ecx") result,
-            out("eax") _,
-            out("ebx") _,
-            out("edx") _,
-            options(nomem, nostack)
-        );
-    }
+    let result = core::arch::x86_64::__cpuid(1);
     // Bit 21 of ECX indicates x2APIC availability
-    result & (1 << 21) != 0
+    result.ecx & (1 << 21) != 0
 }
 
 /// Get the APIC ID of the current processor.

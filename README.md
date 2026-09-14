@@ -33,6 +33,38 @@ jump.
 None of this is meant to be production-grade — it's a from-scratch
 exploration of what a kernel needs to do to get from firmware to ring 3.
 
+## Cargo features
+
+Every optional subsystem is gated behind a Cargo feature, **all on by
+default** — plain `cargo build` / `make` gets the full kernel. Disabling a
+feature actually removes that code from the build (not just from the boot
+sequence): unmask the matching PIC line and nothing fires it, remove the
+module and nothing references it.
+
+| Feature | Gates |
+|---|---|
+| `heap` | `mem::heap`, the `#[global_allocator]` — pulls in `alloc` |
+| `frame-alloc` | `mem::frame`, the physical frame allocator |
+| `paging` | `mem::paging`, the virtual memory manager (implies `frame-alloc`) |
+| `storage` | ATA driver + FAT32 + initrd, and the syscalls that use them — `open`/`close`/`lseek`/`getdents64`, the file-backed paths of `read`/`write`, and `tree` (implies `heap` + `frame-alloc`) |
+| `keyboard` | PS/2 keyboard driver + IRQ1 wiring |
+| `serial-input` | Serial (COM1) *input* — output (kernel logging) is always on |
+| `pit-100hz` | Reprogram the PIT to 100 Hz; off = its ~18.2 Hz power-on default |
+| `apic` | Local APIC driver (`arch::x86_64::apic`) — not wired into boot either way; available infrastructure |
+| `usermode-demo` | SYSCALL/SYSRET setup, the syscall dispatch table, and the ring-3 demo program that exercises it |
+
+Build a reduced kernel with `--no-default-features --features <list>`, or
+override the Makefile's `FEATURES` variable:
+
+```sh
+make FEATURES="--no-default-features --features heap,keyboard"
+```
+
+Disabling `usermode-demo` (or `storage` alone, which the demo detects and
+skips) is the most visible change — the kernel finishes its boot sequence
+and just halts instead of jumping to ring 3. See `[features]` in
+`Cargo.toml` for the exact dependency graph.
+
 ## Requirements
 
 - Rust **nightly** (pinned via `rust-toolchain.toml`) with `rust-src`

@@ -3,6 +3,8 @@
 pub mod ringbuf;
 pub mod spinlock;
 
-pub use ringbuf::{LogRingBuffer, RingBuffer};
+pub use ringbuf::LogRingBuffer;
+#[cfg(any(feature = "keyboard", feature = "serial-input"))]
+pub use ringbuf::RingBuffer;
 #[allow(unused_imports)]
 pub use spinlock::{Spinlock, SpinlockGuard};

@@ -59,6 +59,7 @@ impl MemoryRegion {
 
 /// Tag types we care about.
 const TAG_TYPE_END: u32 = 0;
+#[cfg(feature = "storage")]
 const TAG_TYPE_MODULE: u32 = 3;
 const TAG_TYPE_MMAP: u32 = 6;
 
@@ -87,6 +88,7 @@ struct MmapTagHeader {
 
 /// Module tag header (GRUB `module2` directive). A null-terminated
 /// cmdline string follows, padded out to `size`; we don't read it.
+#[cfg(feature = "storage")]
 #[repr(C)]
 struct ModuleTagHeader {
     tag_type: u32,
@@ -97,12 +99,14 @@ struct ModuleTagHeader {
 
 /// A boot module loaded by the bootloader alongside the kernel (used for
 /// the initrd) — a flat physical address range, nothing more.
+#[cfg(feature = "storage")]
 #[derive(Debug, Clone, Copy)]
 pub struct Module {
     pub start: u32,
     pub end: u32,
 }
 
+#[cfg(feature = "storage")]
 impl Module {
     pub fn len(&self) -> usize {
         (self.end - self.start) as usize
@@ -245,6 +249,7 @@ pub unsafe fn parse_memory_map(mb_info_addr: u64) -> MemoryMap {
 /// # Safety
 /// Same requirement as [`parse_memory_map`]: `mb_info_addr` must be the
 /// valid, readable physical address GRUB passed in RSI.
+#[cfg(feature = "storage")]
 pub unsafe fn find_first_module(mb_info_addr: u64) -> Option<Module> {
     let header = &*(mb_info_addr as *const BootInfoHeader);
     let total_size = header.total_size as usize;
