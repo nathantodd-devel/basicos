@@ -1,0 +1,39 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // Same target as `make gdb` + `debug.gdb` (see that file's header
+      // for what each setup command is for) and .zed/debug.json's
+      // equivalent config — all three attach to QEMU's gdbstub on
+      // localhost:1234. Requires the ms-vscode.cpptools extension.
+      "name": "basicos: QEMU (GDB remote)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/kernel.bin",
+      "cwd": "${workspaceFolder}",
+      "MIMode": "gdb",
+      "miDebuggerServerAddress": "localhost:1234",
+      "stopAtEntry": false,
+      "preLaunchTask": "basicos: start QEMU (halted, GDB)",
+      "setupCommands": [
+        {
+          "description": "Enable pretty-printing for gdb",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        },
+        { "text": "set architecture i386:x86-64" },
+        { "text": "set disassembly-flavor intel" }
+      ],
+      // QEMU is halted at the literal reset vector (16-bit real mode,
+      // before BIOS even runs) when this connects — these run right
+      // after the `target remote` connect, so the breakpoint exists
+      // before the auto-continue below runs BIOS -> GRUB -> our boot
+      // code, stopping right as kernel_main starts. Same reasoning as
+      // debug.gdb's own header.
+      "postRemoteConnectCommands": [
+        { "text": "break kernel_main" },
+        { "text": "continue", "ignoreFailures": true }
+      ]
+    }
+  ]
+}

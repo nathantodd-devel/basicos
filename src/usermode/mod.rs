@@ -200,6 +200,25 @@ pub extern "C" fn user_mode_stub() -> ! {
         demo_read_file(b"/greeting.txt\0");
     }
 
+    // Deliberately not here: directly calling `alloc::vec::Vec`/`Box`/etc
+    // from this function. `mem::heap`'s global allocator is protected by
+    // a `Spinlock` that unconditionally executes `cli`/`sti` — privileged
+    // instructions, illegal below CPL 0 — and this function always runs
+    // at ring 3 in the end. That's true even when it's spawned as a
+    // `sched` task rather than reached via `gdt::jump_to_ring3` directly:
+    // its first `syscall` returns via `sysretq`, which forces CPL 3
+    // unconditionally (the hardcoded ring-3 selectors in `STAR` — see
+    // `arch::x86_64::syscall::init`), regardless of which ring made the
+    // call. So a heap access placed here doesn't fail loudly at the
+    // point it's spawned wrong; it runs fine until the first real
+    // allocation, then `cli` inside `Spinlock::lock()` takes a #GP(0)
+    // ("privileged instruction") that looks nothing like the actual
+    // problem. If you want to exercise the allocator, do it somewhere
+    // that's genuinely ring 0 — a `sched` task, or the shell (see
+    // `shell::cmd_heapfill`) — the same way file I/O here goes through a
+    // syscall instead of touching `fs::Fat32Fs` directly.
+
+    syscall::syscall0(nr::KPANIC);
     syscall::syscall1(nr::EXIT, 0);
 
     unreachable!()

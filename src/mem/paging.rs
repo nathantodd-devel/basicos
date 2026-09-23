@@ -13,6 +13,55 @@ pub const PAGE_SIZE: usize = FRAME_SIZE;
 /// Number of entries in a page table.
 const ENTRIES_PER_TABLE: usize = 512;
 
+// --- the process-private zone --------------------------------------------
+//
+// `entrypoint.s` identity-maps the first 1 GiB with 2 MiB huge pages — one
+// P2 entry per 2 MiB, no P1 (page table) level at all underneath. That's
+// fine for a kernel with a single shared address space, but it means
+// there's no granularity to give two processes *different* physical
+// backing at the same virtual address, which is the whole point of a
+// process having its own address space.
+//
+// `demote_process_zone()` fixes that for one fixed 16 MiB slice, turning
+// its huge-page P2 entries into real P1 tables (preserving the exact same
+// identity mapping — purely structural, nothing moves). Every process's
+// own address space (`PageMapper::new_process_space`/`fork_from`) then
+// gets its *own* private P1 tables for just this slice, while everything
+// else in the 1 GiB range — kernel code, the heap, page tables themselves
+// — stays the single shared mapping it always was, copied by reference
+// (literally the same P2 entries) into every process's table.
+//
+// The physical range under this slice is reserved from the frame
+// allocator (see `lib.rs`), so `frame::allocate()` never hands out a
+// frame that falls inside it — every frame used to back a process's own
+// pages therefore comes from *outside* the slice, where the identity
+// mapping is untouched and universally shared. That's what lets kernel
+// code safely `memcpy` into a freshly allocated frame via its raw
+// physical address no matter whose CR3 happens to be loaded (see
+// `PageMapper::clone_from_template`).
+//
+// Layout within the zone (all page-aligned, chosen to fit comfortably
+// inside the 1 GiB/frame-allocator-tracked range even under a modest
+// test VM):
+//   0x600000 (6 MiB)  CODE   4 MiB  — ELF image (matches testprog.ld)
+//   0xA00000 (10 MiB) HEAP   5 MiB  — grows up via brk()
+//   0xF00000 (15 MiB) MMAP   6 MiB  — bump-allocated via mmap()
+//   0x1500000 (21 MiB) STACK 1 MiB — grows down
+pub const PROC_ZONE_START: usize = 0x600000;
+pub const PROC_CODE_START: usize = PROC_ZONE_START;
+pub const PROC_CODE_SIZE: usize = 4 * 1024 * 1024;
+pub const PROC_HEAP_START: usize = PROC_CODE_START + PROC_CODE_SIZE;
+pub const PROC_HEAP_SIZE: usize = 5 * 1024 * 1024;
+pub const PROC_MMAP_START: usize = PROC_HEAP_START + PROC_HEAP_SIZE;
+pub const PROC_MMAP_SIZE: usize = 6 * 1024 * 1024;
+pub const PROC_STACK_START: usize = PROC_MMAP_START + PROC_MMAP_SIZE;
+pub const PROC_STACK_SIZE: usize = 1024 * 1024;
+pub const PROC_ZONE_END: usize = PROC_STACK_START + PROC_STACK_SIZE;
+pub const PROC_ZONE_SIZE: usize = PROC_ZONE_END - PROC_ZONE_START;
+
+const _: () = assert!(PROC_ZONE_START % (2 * 1024 * 1024) == 0);
+const _: () = assert!(PROC_ZONE_END % (2 * 1024 * 1024) == 0);
+
 /// Page table entry flags.
 pub mod flags {
     pub const PRESENT: u64 = 1 << 0;
@@ -388,6 +437,265 @@ impl PageMapper {
         let virt = VirtualAddress::new(frame.start_address() as u64);
         self.map(virt, frame, flags)
     }
+
+    /// Wrap an already-existing address space (e.g. a process's stored
+    /// CR3 value) so it can be operated on with `map`/`unmap`/etc — every
+    /// method above works against `self`'s own table hierarchy via raw
+    /// physical-address dereferences, not "whatever CR3 happens to be
+    /// loaded right now", so this is safe to call for any process
+    /// regardless of which address space is currently active.
+    pub fn for_address_space(p4_physical: u64) -> Self {
+        Self { p4_physical }
+    }
+
+    /// This address space's CR3 value.
+    pub fn cr3(&self) -> u64 {
+        self.p4_physical
+    }
+
+    /// Allocate a fresh, zeroed frame and map it at `virt` within *this*
+    /// address space.
+    ///
+    /// # Safety
+    /// The virtual address must be page-aligned and not already mapped.
+    pub unsafe fn alloc_and_map(&mut self, virt: u64, flags: u64) -> Result<Frame, MapError> {
+        let frame = allocate().ok_or(MapError::OutOfFrames)?;
+        ptr::write_bytes(frame.start_address() as *mut u8, 0, PAGE_SIZE);
+        self.map(VirtualAddress::new(virt), frame, flags)?;
+        Ok(frame)
+    }
+
+    /// Unmap `virt` within *this* address space and free its frame.
+    ///
+    /// # Safety
+    /// The virtual address must be mapped and its frame must have been
+    /// allocated by the frame allocator.
+    pub unsafe fn unmap_and_free(&mut self, virt: u64) -> Result<(), MapError> {
+        let frame = self.unmap(VirtualAddress::new(virt))?;
+        deallocate(frame);
+        Ok(())
+    }
+
+    /// Build a fresh process address space: identical to the kernel's own
+    /// tables everywhere except `PROC_ZONE_START..PROC_ZONE_END`, which
+    /// starts out completely unmapped — nothing lives there until the
+    /// caller `map()`s something in (loading an ELF, `brk`, `mmap`, the
+    /// user stack). Requires `demote_process_zone()` to have already run.
+    pub fn new_process_space() -> Self {
+        Self::clone_from_template(None)
+    }
+
+    /// Build a new process address space that's a deep copy of `parent`'s:
+    /// every page currently mapped inside the process zone gets its own
+    /// freshly allocated physical frame with the same contents, so the
+    /// two can diverge from here on without stepping on each other.
+    /// Everything outside the zone (kernel/shared mappings) is copied by
+    /// reference, same as `new_process_space`. This is what `fork()` uses.
+    pub fn fork_from(parent: &PageMapper) -> Self {
+        Self::clone_from_template(Some(parent))
+    }
+
+    /// Shared implementation of `new_process_space`/`fork_from`: builds a
+    /// new P4/P3/P2 that's a byte-for-byte copy of the kernel's own boot
+    /// tables (so every non-zone mapping — kernel code, heap, page tables
+    /// — is inherited unchanged), then fills in the process-zone P2
+    /// entries either empty (`parent = None`) or as a deep copy of
+    /// `parent`'s own zone mappings.
+    ///
+    /// # Safety (internal invariant, not a `pub unsafe fn`)
+    /// Every frame this allocates — for new page tables, and for deep
+    /// copies of a parent's data pages — comes from `frame::allocate()`,
+    /// which never hands out anything inside the process zone's reserved
+    /// physical range (see the module docs). That's what makes it sound
+    /// to `memcpy` into these frames via raw physical pointers below,
+    /// regardless of which address space is currently loaded in CR3.
+    fn clone_from_template(parent: Option<&PageMapper>) -> Self {
+        let start_idx = VirtualAddress::new(PROC_ZONE_START as u64).p2_index();
+        let end_idx = VirtualAddress::new((PROC_ZONE_END - PAGE_SIZE) as u64).p2_index();
+
+        unsafe {
+            let kernel_guard = PAGE_MAPPER.lock();
+            let kernel = kernel_guard.as_ref().expect("paging not initialized");
+            let kp4 = &*(kernel.p4_physical as *const PageTable);
+            let kp3 = &*(kp4.entry(0).address() as *const PageTable);
+            let kp2 = &*(kp3.entry(0).address() as *const PageTable);
+
+            let p2_frame = allocate().expect("out of frames for new address space");
+            let p2 = &mut *(p2_frame.start_address() as *mut PageTable);
+            core::ptr::copy_nonoverlapping(kp2 as *const PageTable, p2 as *mut PageTable, 1);
+
+            match parent {
+                None => {
+                    for idx in start_idx..=end_idx {
+                        p2.entry_mut(idx).clear();
+                    }
+                }
+                Some(parent) => {
+                    let pp4 = &*(parent.p4_physical as *const PageTable);
+                    let pp3 = &*(pp4.entry(0).address() as *const PageTable);
+                    let pp2 = &*(pp3.entry(0).address() as *const PageTable);
+
+                    for idx in start_idx..=end_idx {
+                        let parent_entry = pp2.entry(idx);
+                        if !parent_entry.is_present() {
+                            p2.entry_mut(idx).clear();
+                            continue;
+                        }
+                        let parent_p1 = &*(parent_entry.address() as *const PageTable);
+                        let child_p1_frame =
+                            allocate().expect("out of frames forking address space");
+                        let child_p1 = &mut *(child_p1_frame.start_address() as *mut PageTable);
+                        child_p1.zero();
+                        for i in 0..ENTRIES_PER_TABLE {
+                            let src = parent_p1.entry(i);
+                            if !src.is_present() {
+                                continue;
+                            }
+                            let new_frame =
+                                allocate().expect("out of frames forking address space");
+                            core::ptr::copy_nonoverlapping(
+                                src.address() as *const u8,
+                                new_frame.start_address() as *mut u8,
+                                PAGE_SIZE,
+                            );
+                            child_p1.entry_mut(i).set(new_frame, src.flags());
+                        }
+                        p2.entry_mut(idx).set(child_p1_frame, flags::USER_PAGE);
+                    }
+                }
+            }
+
+            let p3_frame = allocate().expect("out of frames for new address space");
+            let p3 = &mut *(p3_frame.start_address() as *mut PageTable);
+            core::ptr::copy_nonoverlapping(kp3 as *const PageTable, p3 as *mut PageTable, 1);
+            p3.entry_mut(0).set(p2_frame, flags::USER_PAGE);
+
+            let p4_frame = allocate().expect("out of frames for new address space");
+            let p4 = &mut *(p4_frame.start_address() as *mut PageTable);
+            core::ptr::copy_nonoverlapping(kp4 as *const PageTable, p4 as *mut PageTable, 1);
+            p4.entry_mut(0).set(p3_frame, flags::USER_PAGE);
+
+            PageMapper {
+                p4_physical: p4_frame.start_address() as u64,
+            }
+        }
+    }
+
+    /// Unmap and free every currently-present page inside the process
+    /// zone, keeping the address space's own P1/P2/P3/P4 structure
+    /// intact (just emptied) so it can be reused immediately — what
+    /// `execve()` uses to tear down a process's old image before loading
+    /// a new one into the same address space.
+    ///
+    /// # Safety
+    /// Must not be called while any of the unmapped pages are still in
+    /// use (e.g. by another task sharing this address space — this
+    /// kernel doesn't have those, but if it ever does, this needs to
+    /// change).
+    pub unsafe fn unmap_zone(&mut self) {
+        let start_idx = VirtualAddress::new(PROC_ZONE_START as u64).p2_index();
+        let end_idx = VirtualAddress::new((PROC_ZONE_END - PAGE_SIZE) as u64).p2_index();
+
+        let p4 = &*(self.p4_physical as *const PageTable);
+        let p3 = &*(p4.entry(0).address() as *const PageTable);
+        let p2 = &*(p3.entry(0).address() as *const PageTable);
+
+        for idx in start_idx..=end_idx {
+            let entry = p2.entry(idx);
+            if !entry.is_present() {
+                continue;
+            }
+            let p1 = &mut *(entry.address() as *mut PageTable);
+            for i in 0..ENTRIES_PER_TABLE {
+                let e = p1.entry_mut(i);
+                if e.is_present() {
+                    deallocate(e.frame());
+                    e.clear();
+                }
+            }
+        }
+        flush_tlb_all();
+    }
+
+    /// Free every frame this address space owns exclusively: its own
+    /// process-zone data pages and P1 tables, and its own P4/P3/P2. Does
+    /// *not* touch anything outside the zone — that's the shared kernel
+    /// mapping, owned by nobody in particular.
+    ///
+    /// # Safety
+    /// Nothing may access any address inside this address space's
+    /// process zone after this returns. It *is* fine to call this while
+    /// `self` is still the address space loaded in CR3 (`exit_process`
+    /// does exactly that) — every frame this frees comes from outside
+    /// the zone's own reserved physical range or is a table these raw
+    /// physical dereferences don't need CR3 for in the first place, and
+    /// nothing kernel-side ever touches the zone, so a CR3 that's
+    /// nominally "stale" for one more scheduler tick is harmless (see
+    /// `sched`'s module docs on why CR3 can lag briefly between
+    /// switches).
+    pub unsafe fn destroy(self) {
+        let start_idx = VirtualAddress::new(PROC_ZONE_START as u64).p2_index();
+        let end_idx = VirtualAddress::new((PROC_ZONE_END - PAGE_SIZE) as u64).p2_index();
+
+        let p4 = &*(self.p4_physical as *const PageTable);
+        let p3_phys = p4.entry(0).address();
+        let p3 = &*(p3_phys as *const PageTable);
+        let p2_phys = p3.entry(0).address();
+        let p2 = &*(p2_phys as *const PageTable);
+
+        for idx in start_idx..=end_idx {
+            let entry = p2.entry(idx);
+            if !entry.is_present() {
+                continue;
+            }
+            let p1 = &*(entry.address() as *const PageTable);
+            for i in 0..ENTRIES_PER_TABLE {
+                let e = p1.entry(i);
+                if e.is_present() {
+                    deallocate(e.frame());
+                }
+            }
+            deallocate(Frame::containing_address(entry.address() as usize));
+        }
+        deallocate(Frame::containing_address(p2_phys as usize));
+        deallocate(Frame::containing_address(p3_phys as usize));
+        deallocate(Frame::containing_address(self.p4_physical as usize));
+    }
+}
+
+/// Turn the process zone's huge-page P2 entries into real 4 KiB page
+/// tables — see the module docs above `PROC_ZONE_START`. Call once, after
+/// `init()`, before any process address space is created.
+pub fn demote_process_zone() {
+    let start_idx = VirtualAddress::new(PROC_ZONE_START as u64).p2_index();
+    let end_idx = VirtualAddress::new((PROC_ZONE_END - PAGE_SIZE) as u64).p2_index();
+
+    let mut guard = PAGE_MAPPER.lock();
+    let mapper = guard.as_mut().expect("paging not initialized");
+    unsafe {
+        let p4 = &*(mapper.p4_physical as *const PageTable);
+        let p3_phys = p4.entry(0).address();
+        let p3 = &*(p3_phys as *const PageTable);
+        let p2_phys = p3.entry(0).address();
+        let p2 = &mut *(p2_phys as *mut PageTable);
+
+        for idx in start_idx..=end_idx {
+            let entry = p2.entry_mut(idx);
+            debug_assert!(entry.is_present() && entry.is_huge());
+            let base_phys = entry.address();
+
+            let p1_frame = allocate().expect("out of frames demoting process zone");
+            let p1 = &mut *(p1_frame.start_address() as *mut PageTable);
+            for i in 0..ENTRIES_PER_TABLE {
+                let phys = base_phys + (i * PAGE_SIZE) as u64;
+                p1.entry_mut(i)
+                    .set(Frame::containing_address(phys as usize), flags::USER_PAGE);
+            }
+            entry.set(p1_frame, flags::USER_PAGE);
+        }
+    }
+    drop(guard);
+    flush_tlb_all();
 }
 
 /// Errors that can occur during mapping.
@@ -410,6 +718,18 @@ static PAGE_MAPPER: Spinlock<Option<PageMapper>> = Spinlock::new(None);
 pub fn init() {
     let mut mapper = PAGE_MAPPER.lock();
     *mapper = Some(PageMapper::current());
+}
+
+/// The kernel's own (boot-time) CR3 value — what a plain kernel thread
+/// should run under. Every process address space is a clone of this one
+/// (see `PageMapper::clone_from_template`), so it's also the structural
+/// template for "everything outside the process zone."
+pub fn boot_cr3() -> u64 {
+    PAGE_MAPPER
+        .lock()
+        .as_ref()
+        .expect("paging not initialized")
+        .cr3()
 }
 
 /// Map a virtual address to a physical frame.

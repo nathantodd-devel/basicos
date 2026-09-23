@@ -5,6 +5,7 @@ json-target-spec = true
 
 [build]
 target = "x86_64-basicos.json"
+rustflags = ["-C", "force-frame-pointers=yes"]
 
 [target.'cfg(target_os = "none")']
 runner = "true"

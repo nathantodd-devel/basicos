@@ -1,38 +1,107 @@
 //! Kernel heap allocator, wired up as `#[global_allocator]`.
 //!
-//! There's no physical frame allocator or paging management yet (see
-//! `todo.md`), so the heap is just a fixed-size region reserved in
-//! `.bss` — the same trick `lib.rs` uses for `USER_STACK`. It's backed by
-//! a hand-rolled intrusive free-list allocator (first-fit, no
-//! coalescing on free): enough to unblock `alloc::{boxed::Box,
-//! vec::Vec, ...}` before real memory management exists.
+//! With `frame-alloc` on, the heap claims most of physical RAM — real
+//! "full heap access" rather than a small fixed pool — by asking
+//! `mem::frame` for the biggest contiguous run of frames it can get
+//! (see [`init`] for exactly how). Physical == virtual here (the
+//! boot-time identity map, not per-process paging — see `todo.md`), so
+//! whatever frames come back are immediately usable as-is.
+//!
+//! Without `frame-alloc` there's no way to ask how much RAM exists or
+//! claim any of it, so the heap falls back to the original fixed-size
+//! `.bss` region — the same trick `lib.rs` uses for `USER_STACK`.
+//!
+//! Either way it's backed by a hand-rolled intrusive free-list
+//! allocator (first-fit, no coalescing on free): enough to unblock
+//! `alloc::{boxed::Box, vec::Vec, ...}` before real memory management
+//! exists. Non-coalescing does mean a workload that keeps reallocating
+//! ever-larger buffers (a `Vec` growing without bound, say) can exhaust
+//! the heap well before every byte of it is technically "in use" —
+//! that's expected, not a bug, and it fails cleanly: `GlobalAlloc::alloc`
+//! returning null routes through Rust's normal `handle_alloc_error` ->
+//! panic path (`panic.rs`), not silent corruption.
 
 use crate::sync::Spinlock;
 use core::alloc::{GlobalAlloc, Layout};
 use core::mem;
 use core::ptr;
 
-/// Heap size in bytes. Arbitrary — we can't yet ask multiboot2 how much
-/// RAM is actually available, so this is just "comfortably small".
-pub const HEAP_SIZE: usize = 256 * 1024; // 256 KiB
+#[cfg(not(feature = "frame-alloc"))]
+mod fixed {
+    /// No frame allocator to ask "how much RAM is there" — 1 MiB,
+    /// arbitrary but comfortably more than this kernel's own structures
+    /// need (FAT32 buffers, directory listings, syscall file
+    /// descriptors, ...) without frame-backed sizing to lean on.
+    pub const HEAP_SIZE: usize = 1024 * 1024;
 
-#[repr(align(16))]
-struct HeapMemory([u8; HEAP_SIZE]);
+    #[repr(align(16))]
+    pub struct HeapMemory(pub [u8; HEAP_SIZE]);
 
-static mut HEAP_MEMORY: HeapMemory = HeapMemory([0; HEAP_SIZE]);
+    pub static mut HEAP_MEMORY: HeapMemory = HeapMemory([0; HEAP_SIZE]);
+}
 
 #[global_allocator]
 static ALLOCATOR: Spinlock<LinkedListAllocator> = Spinlock::new(LinkedListAllocator::new());
 
-/// Hand the allocator its backing region.
+/// Hand the allocator its backing region and return its size in bytes.
 ///
 /// Call once from `kernel_main`, before any code uses `alloc::{Box, Vec,
 /// ...}` — allocations before this point just get a null pointer back.
-pub fn init() {
-    unsafe {
-        let heap_start = core::ptr::addr_of!(HEAP_MEMORY.0) as usize;
-        ALLOCATOR.lock().init(heap_start, HEAP_SIZE);
+///
+/// # Panics
+/// With `frame-alloc` on, if even a minimal (1 MiB) contiguous claim
+/// fails — meaning there's essentially no usable RAM at all, a boot
+/// environment nothing else here would work in either.
+pub fn init() -> usize {
+    #[cfg(feature = "frame-alloc")]
+    {
+        init_dynamic()
     }
+    #[cfg(not(feature = "frame-alloc"))]
+    {
+        unsafe {
+            let heap_start = core::ptr::addr_of!(fixed::HEAP_MEMORY.0) as usize;
+            ALLOCATOR.lock().init(heap_start, fixed::HEAP_SIZE);
+        }
+        fixed::HEAP_SIZE
+    }
+}
+
+#[cfg(feature = "frame-alloc")]
+fn init_dynamic() -> usize {
+    use crate::mem::frame;
+
+    // Free space is essentially never one perfectly contiguous run by
+    // this point: the low 1 MiB, the kernel image, and (if `elf-loader`
+    // is on) the reserved ELF load zone have all already carved chunks
+    // out of it (see `lib.rs`). `allocate_contiguous` needs one run, so
+    // ask for "all of it" and back off geometrically until a claim
+    // actually lands — that finds the largest surviving contiguous
+    // block without needing a "what's my biggest run" query this
+    // allocator doesn't have.
+    const MIN_HEAP_FRAMES: usize = 256; // 1 MiB — the old fixed size, as a floor
+    const RESERVE_FRAMES: usize = 256; // 1 MiB left free for frame use later on
+
+    let mut want = frame::free_count().saturating_sub(RESERVE_FRAMES);
+    let frame = loop {
+        assert!(
+            want >= MIN_HEAP_FRAMES,
+            "mem::heap: couldn't claim even a {} KiB contiguous heap ({} frames free total)",
+            MIN_HEAP_FRAMES * frame::FRAME_SIZE / 1024,
+            frame::free_count(),
+        );
+        match frame::allocate_contiguous(want) {
+            Some(frame) => break frame,
+            None => want = want * 3 / 4, // back off 25% and retry
+        }
+    };
+
+    let heap_start = frame.start_address();
+    let heap_size = want * frame::FRAME_SIZE;
+    unsafe {
+        ALLOCATOR.lock().init(heap_start, heap_size);
+    }
+    heap_size
 }
 
 /// A free block, stored inline at the start of its own memory.

@@ -1,0 +1,32 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      // preLaunchTask for the "basicos: QEMU (GDB remote)" config in
+      // launch.json. `make gdb` boots QEMU halted with -s -S and never
+      // exits on its own, so this backgrounds it (detached via setsid,
+      // so it survives this task's own process exiting) and polls
+      // 127.0.0.1:1234 until the gdbstub is actually listening, instead
+      // of racing a cold kernel build with the debugger's connect
+      // attempt. QEMU is left running after the debug session ends —
+      // kill it yourself, or `pkill -f 'qemu-system-x86_64.*-S'`,
+      // before starting another one (a second QEMU can't rebind :1234).
+      "label": "basicos: start QEMU (halted, GDB)",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "-c",
+        "setsid make gdb > /tmp/basicos-qemu-gdb.log 2>&1 < /dev/null & for i in $(seq 1 120); do (exec 3<>/dev/tcp/127.0.0.1/1234) 2>/dev/null && exec 3<&- 3>&- && exit 0; sleep 0.5; done; echo 'timed out waiting for QEMU gdbstub on :1234 (see /tmp/basicos-qemu-gdb.log)' >&2; exit 1"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "reveal": "silent",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": []
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+# Build outputs and VCS — the container builds from source, from scratch.
+target
+build
+release
+.git
+.claude
+*.log

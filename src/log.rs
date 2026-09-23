@@ -161,18 +161,25 @@ impl Write for RawWriter {
 
 /// Print with log level, formatting, and optional timestamp.
 /// Used by pr_info!, pr_err!, etc.
+///
+/// Runs with interrupts disabled for its whole duration, not just each
+/// individual write: with preemptive scheduling (the `scheduler`
+/// feature), a log line is built from several separate writes
+/// (timestamp, level prefix, message), and without this a preempting
+/// task's own output could land in the middle of ours, interleaving
+/// mid-line instead of printing as a clean, whole line.
 #[doc(hidden)]
 pub fn _kprint_with_level(level: LogLevel, args: fmt::Arguments) {
+    let was_enabled = crate::arch::interrupts::disable();
+
     let mut writer = ConsoleWriter { level };
 
     // Timestamp: [seconds.milliseconds]
     if TIMESTAMPS_ENABLED.load(Ordering::Relaxed) {
-        // Assuming ~100 Hz timer (PIT default is 18.2 Hz, but let's assume
-        // it's been reprogrammed or we adjust accordingly)
         let ticks = TIMER_TICKS.load(Ordering::Relaxed);
-        // For PIT at ~100 Hz: each tick is ~10ms
-        let secs = ticks / 100;
-        let ms = (ticks % 100) * 10;
+        let hz = crate::arch::interrupts::TIMER_HZ as u64;
+        let secs = ticks / hz;
+        let ms = (ticks % hz) * 1000 / hz;
         let _ = write!(writer, "[{:5}.{:03}] ", secs, ms);
     }
 
@@ -181,14 +188,21 @@ pub fn _kprint_with_level(level: LogLevel, args: fmt::Arguments) {
 
     // Actual message
     let _ = writer.write_fmt(args);
+
+    crate::arch::interrupts::restore(was_enabled);
 }
 
 /// Print without level prefix (raw output).
 /// Used by kprint!/kprintln!
+///
+/// Same interrupts-disabled-for-the-whole-call treatment as
+/// `_kprint_with_level`, for the same reason.
 #[doc(hidden)]
 pub fn _kprint(args: fmt::Arguments) {
+    let was_enabled = crate::arch::interrupts::disable();
     let mut writer = RawWriter;
     let _ = writer.write_fmt(args);
+    crate::arch::interrupts::restore(was_enabled);
 }
 
 // ============================================================================

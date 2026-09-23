@@ -158,6 +158,17 @@ pub unsafe fn init() {
     asm!("ltr {0:x}", in(reg) TSS_SELECTOR, options(nostack, preserves_flags));
 }
 
+/// Point `TSS.RSP0` at a different stack — the one the CPU switches to on
+/// any interrupt/exception that takes a ring-3 program back to ring 0.
+/// The scheduler calls this on every switch *into* a task (see `sched`'s
+/// module docs on why ring-3 tasks need their own kernel stack rather
+/// than sharing the single boot-time one this module used to hand out).
+pub fn set_kernel_stack(rsp0: u64) {
+    unsafe {
+        TSS.rsp[0] = rsp0;
+    }
+}
+
 /// Build an `iretq` frame and drop into ring 3 at `entry`, running on
 /// `user_stack_top`. Never returns to the caller — there is no ring-0
 /// control flow left once this executes; ring 0 resumes only when an
@@ -184,6 +195,39 @@ pub unsafe fn jump_to_ring3(entry: extern "C" fn() -> !, user_stack_top: u64) ->
         flags = in(reg) rflags,
         cs = in(reg) user_cs,
         entry = in(reg) entry as u64,
+        options(noreturn)
+    );
+}
+
+/// Same as `jump_to_ring3`, but for a process with its own address space:
+/// switches CR3 first, so `entry`/`user_stack_top` are resolved against
+/// the *new* page tables, not whatever was active before. Used for a
+/// process's very first entry into ring 3 (initial exec, not a return
+/// from a later syscall/interrupt).
+///
+/// # Safety
+/// `cr3` must point to a valid, fully set-up P4 table (see
+/// `mem::paging::PageMapper::new_process_space`) with `entry` and
+/// `user_stack_top` both already mapped in it.
+#[cfg(feature = "paging")]
+pub unsafe fn jump_to_ring3_in(entry_addr: u64, user_stack_top: u64, cr3: u64) -> ! {
+    crate::mem::paging::write_cr3(cr3);
+    let user_cs = (USER_CODE_SELECTOR | 3) as u64;
+    let user_ss = (USER_DATA_SELECTOR | 3) as u64;
+    let rflags: u64 = 0x202;
+
+    asm!(
+        "push {ss}",
+        "push {stack}",
+        "push {flags}",
+        "push {cs}",
+        "push {entry}",
+        "iretq",
+        ss = in(reg) user_ss,
+        stack = in(reg) user_stack_top,
+        flags = in(reg) rflags,
+        cs = in(reg) user_cs,
+        entry = in(reg) entry_addr,
         options(noreturn)
     );
 }

@@ -31,23 +31,39 @@ pub mod nr {
     pub const EXIT: u64 = 60;
     pub const GETPID: u64 = 39;
     pub const YIELD: u64 = 24; // sched_yield
-                               // Only meaningful with the `storage` feature (see `sys_open` etc.),
-                               // but these are just numbers — matching real syscall ABI numbers is
-                               // useful documentation even when the handler isn't compiled in, and
-                               // calling one with `storage` off just falls through to `dispatch`'s
-                               // "unknown syscall" arm (ENOSYS) rather than failing to compile.
+                               // Only meaningful with the `storage`/`elf-loader` features (see
+                               // `sys_open`/`sys_fork` etc.), but these are just numbers — matching
+                               // real syscall ABI numbers is useful documentation even when the
+                               // handler isn't compiled in, and calling one with the feature off
+                               // just falls through to `dispatch`'s "unknown syscall" arm (ENOSYS)
+                               // rather than failing to compile.
     pub const LSEEK: u64 = 8;
     pub const GETDENTS64: u64 = 217; // matches Linux x86_64
+    pub const MMAP: u64 = 9;
+    pub const MUNMAP: u64 = 11;
+    pub const BRK: u64 = 12;
+    pub const FORK: u64 = 57;
+    pub const EXECVE: u64 = 59;
+    pub const WAIT4: u64 = 61;
 
     // basicos-specific syscalls (start at 1000 to avoid Linux conflicts)
-    pub const KLOG: u64 = 1000; // Write to kernel log
-    pub const TREE: u64 = 1001; // Recursively list a mounted filesystem to the kernel log
+    pub const KLOG: u64 = 0x400; // Write to kernel log
+    pub const TREE: u64 = 0x401; // Recursively list a mounted filesystem to the kernel log
+    pub const KPANIC: u64 = 0x402;
+}
+
+/// `mmap()` flags (arg4) — same bit values as Linux x86_64.
+#[cfg(feature = "elf-loader")]
+pub mod mmap_flags {
+    pub const PROT_WRITE: u64 = 0x2;
+    pub const MAP_ANONYMOUS: u64 = 0x20;
 }
 
 /// `TREE` syscall targets (arg1).
 pub mod tree_target {
     pub const DISK: u64 = 0;
     pub const INITRD: u64 = 1;
+    pub const RAMDISK: u64 = 2;
 }
 
 /// `lseek()` whence values (arg3).
@@ -78,6 +94,9 @@ pub mod open_flags {
 // ============================================================================
 
 pub mod errno {
+    pub const ECHILD: i64 = -10; // No child processes
+    pub const EAGAIN: i64 = -11; // Try again (e.g. task table full)
+    pub const ENOMEM: i64 = -12; // Out of memory
     pub const ENOENT: i64 = -2; // No such file or directory
     pub const EIO: i64 = -5; // I/O error
     pub const EBADF: i64 = -9; // Bad file descriptor
@@ -98,38 +117,6 @@ const STDIN: u64 = 0;
 const STDOUT: u64 = 1;
 const STDERR: u64 = 2;
 
-/// Which mounted filesystem a path refers to. There's no real VFS/mount
-/// table yet, so this is the whole namespace: `/initrd/...` (or exactly
-/// `/initrd`) means the initrd image, everything else means the disk.
-#[cfg(feature = "storage")]
-#[derive(Debug, Clone, Copy)]
-enum FsTarget {
-    Disk,
-    Initrd,
-}
-
-#[cfg(feature = "storage")]
-fn with_fs<R>(target: FsTarget, f: impl FnOnce(&mut fs::Fat32Fs) -> R) -> Option<R> {
-    match target {
-        FsTarget::Disk => fs::with_disk(f),
-        FsTarget::Initrd => fs::with_initrd(f),
-    }
-}
-
-/// Split a syscall path into which filesystem it targets and the
-/// remaining path within that filesystem (no leading `/`).
-#[cfg(feature = "storage")]
-fn split_target(path: &str) -> (FsTarget, String) {
-    let trimmed = path.trim_start_matches('/');
-    if trimmed == "initrd" {
-        (FsTarget::Initrd, String::new())
-    } else if let Some(rest) = trimmed.strip_prefix("initrd/") {
-        (FsTarget::Initrd, String::from(rest))
-    } else {
-        (FsTarget::Disk, String::from(trimmed))
-    }
-}
-
 /// A process's open file or directory. Files are read/written entirely
 /// in memory and only touch the FAT32 driver at `open()` (read) and
 /// `close()` (write-back, if anything was written) — there's no
@@ -138,7 +125,7 @@ fn split_target(path: &str) -> (FsTarget, String) {
 #[cfg(feature = "storage")]
 enum OpenFile {
     File {
-        target: FsTarget,
+        target: fs::Drive,
         path: String,
         data: Vec<u8>,
         pos: usize,
@@ -208,9 +195,9 @@ pub extern "C" fn dispatch(
     arg1: u64,
     arg2: u64,
     arg3: u64,
-    _arg4: u64,
-    _arg5: u64,
-    _arg6: u64,
+    #[cfg_attr(not(feature = "elf-loader"), allow(unused_variables))] arg4: u64,
+    #[cfg_attr(not(feature = "elf-loader"), allow(unused_variables))] arg5: u64,
+    #[cfg_attr(not(feature = "elf-loader"), allow(unused_variables))] arg6: u64,
 ) -> i64 {
     match number {
         nr::READ => sys_read(arg1, arg2, arg3),
@@ -226,9 +213,22 @@ pub extern "C" fn dispatch(
         nr::LSEEK => sys_lseek(arg1, arg2, arg3),
         #[cfg(feature = "storage")]
         nr::GETDENTS64 => sys_getdents64(arg1, arg2, arg3),
+        #[cfg(feature = "elf-loader")]
+        nr::MMAP => sys_mmap(arg1, arg2, arg3, arg4, arg5, arg6),
+        #[cfg(feature = "elf-loader")]
+        nr::MUNMAP => sys_munmap(arg1, arg2),
+        #[cfg(feature = "elf-loader")]
+        nr::BRK => sys_brk(arg1),
+        #[cfg(feature = "elf-loader")]
+        nr::FORK => sys_fork(),
+        #[cfg(feature = "elf-loader")]
+        nr::EXECVE => sys_execve(arg1, arg2, arg3),
+        #[cfg(feature = "elf-loader")]
+        nr::WAIT4 => sys_wait4(arg1, arg2, arg3),
         nr::KLOG => sys_klog(arg1, arg2),
         #[cfg(feature = "storage")]
         nr::TREE => sys_tree(arg1),
+        nr::KPANIC => sys_kpanic(),
         _ => {
             pr_debug!("Unknown syscall: {}", number);
             errno::ENOSYS
@@ -345,8 +345,8 @@ fn sys_write(fd: u64, buf: u64, count: u64) -> i64 {
 
 /// open(path, flags, mode) - Open (optionally creating) a file or
 /// directory on one of the mounted FAT32 filesystems, returning a new
-/// fd. `path` is resolved by `split_target`: `/initrd/...` for the
-/// initrd, anything else for the disk.
+/// fd. `path` is resolved by `fs::resolve_path`: DOS-style drive
+/// letters (`A:`/`B:`/`C:`), or the older no-prefix/`/initrd/...` rules.
 #[cfg(feature = "storage")]
 fn sys_open(path_ptr: u64, flags: u64, _mode: u64) -> i64 {
     use open_flags::*;
@@ -354,11 +354,12 @@ fn sys_open(path_ptr: u64, flags: u64, _mode: u64) -> i64 {
     let Some(path) = read_user_cstring(path_ptr) else {
         return errno::EFAULT;
     };
-    let (target, rel_path) = split_target(&path);
+    let (target, rel_path) = fs::resolve_path(&path);
+    let rel_path = String::from(rel_path);
     let creating = flags & O_CREAT != 0;
     let truncating = flags & O_TRUNC != 0;
 
-    let opened: Option<Result<OpenFile, i64>> = with_fs(target, |vol| {
+    let opened: Option<Result<OpenFile, i64>> = fs::with_drive(target, |vol| {
         if rel_path.is_empty() {
             return vol
                 .read_dir_at("/")
@@ -423,7 +424,7 @@ fn sys_close(fd: u64) -> i64 {
             if !dirty {
                 return 0;
             }
-            match with_fs(target, |vol| vol.write_file(&path, &data)) {
+            match fs::with_drive(target, |vol| vol.write_file(&path, &data)) {
                 Some(Ok(())) => 0,
                 Some(Err(_)) => errno::EIO,
                 None => errno::ENODEV,
@@ -531,15 +532,15 @@ fn sys_getdents64(fd: u64, dirp: u64, count: u64) -> i64 {
     written as i64
 }
 
-/// exit(status) - Terminate the current process.
+/// exit(status) - Terminate the current process. Frees its address space
+/// immediately and turns it into a zombie for a parent's `wait`/`waitpid`
+/// to reap (see `sched::exit_process`) — or, without `elf-loader` (so no
+/// real process table exists at all), just halts as before.
 fn sys_exit(status: i32) -> i64 {
     pr_info!("Process exited with status: {}", status);
-
-    // For now, just halt. In a real kernel, we'd:
-    // 1. Mark the process as zombie
-    // 2. Free its resources
-    // 3. Notify parent
-    // 4. Schedule next process
+    #[cfg(feature = "elf-loader")]
+    crate::sched::exit_process(status);
+    #[cfg(not(feature = "elf-loader"))]
     loop {
         unsafe {
             core::arch::asm!("cli", "hlt");
@@ -549,15 +550,138 @@ fn sys_exit(status: i32) -> i64 {
 
 /// getpid() - Get the current process ID.
 fn sys_getpid() -> i64 {
-    // TODO: Return actual PID once we have a process table
-    1 // Init process
+    #[cfg(feature = "elf-loader")]
+    {
+        crate::sched::current_pid() as i64
+    }
+    #[cfg(not(feature = "elf-loader"))]
+    {
+        1
+    }
 }
 
 /// yield() - Yield the CPU to another process.
 fn sys_yield() -> i64 {
-    // TODO: Implement once we have a scheduler
-    // For now, just return success
+    #[cfg(feature = "scheduler")]
+    crate::sched::yield_now();
     0
+}
+
+/// fork() - Duplicate the calling process. Returns the child's pid in
+/// the parent; the child never actually executes this function (it
+/// resumes directly via `arch::x86_64::syscall::fork_child_entry` with
+/// RAX already forced to 0 — see `sched::fork_current`'s doc comment).
+#[cfg(feature = "elf-loader")]
+fn sys_fork() -> i64 {
+    match crate::sched::fork_current() {
+        Some(pid) => pid as i64,
+        None => errno::EAGAIN,
+    }
+}
+
+/// Read a NULL-terminated array of user pointers-to-C-strings (an
+/// `argv`/`envp`-shaped array) into owned `String`s. Same trust level as
+/// `read_user_cstring`: a bounded scan, no page-table validation.
+#[cfg(feature = "elf-loader")]
+fn read_user_argv(ptr: u64) -> Vec<String> {
+    const MAX_ARGS: usize = 16;
+    let mut out = Vec::new();
+    if ptr == 0 {
+        return out;
+    }
+    // Safety: bounded read of up to MAX_ARGS pointers; the loop below
+    // stops at the first NULL, so this never reads past whichever comes
+    // first — the real terminator or index MAX_ARGS.
+    let ptrs = unsafe { core::slice::from_raw_parts(ptr as *const u64, MAX_ARGS) };
+    for &p in ptrs {
+        if p == 0 {
+            break;
+        }
+        match read_user_cstring(p) {
+            Some(s) => out.push(s),
+            None => break,
+        }
+    }
+    out
+}
+
+/// execve(path, argv, envp) - Replace the calling process's own image
+/// with a freshly loaded ELF binary (same pid, same parent — see
+/// `sched::exec_current`). `envp` is read but ignored: there's no
+/// environment-variable support here, every exec'd process just gets an
+/// empty environment.
+#[cfg(feature = "elf-loader")]
+fn sys_execve(path_ptr: u64, argv_ptr: u64, _envp_ptr: u64) -> i64 {
+    let Some(path) = read_user_cstring(path_ptr) else {
+        return errno::EFAULT;
+    };
+    let argv = read_user_argv(argv_ptr);
+    let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    match crate::sched::exec_current(&path, &argv_refs) {
+        Ok(()) => 0, // never actually observed — the new program starts fresh
+        Err(e) => {
+            pr_debug!("execve: {:?}", e);
+            errno::ENOENT
+        }
+    }
+}
+
+/// wait4(pid, status_ptr, options, rusage) - Block until a child exits
+/// (`pid > 0`: that specific child; otherwise: any child), reap it, and
+/// write its exit status to `status_ptr` (if non-null). `options` and
+/// `rusage` (arg4, not passed here) aren't supported. Returns the reaped
+/// child's pid, or `ECHILD` if the caller has no matching child at all.
+#[cfg(feature = "elf-loader")]
+fn sys_wait4(pid: u64, status_ptr: u64, _options: u64) -> i64 {
+    let target = if (pid as i64) > 0 { Some(pid) } else { None };
+    match crate::sched::wait_for_child(target) {
+        Some((child_pid, status)) => {
+            if status_ptr != 0 {
+                unsafe { *(status_ptr as *mut i32) = status };
+            }
+            child_pid as i64
+        }
+        None => errno::ECHILD,
+    }
+}
+
+/// mmap(addr, len, prot, flags, fd, offset) - Map `len` bytes of fresh,
+/// zeroed anonymous memory into the calling process's own mmap arena
+/// (see `sched::proc_mmap`). `addr` (a placement hint) and `offset` are
+/// ignored; only `MAP_ANONYMOUS` is supported — there's no page cache
+/// here to back a file-backed mapping with, so anything else is EINVAL.
+#[cfg(feature = "elf-loader")]
+fn sys_mmap(_addr: u64, len: u64, prot: u64, flags: u64, fd: u64, _offset: u64) -> i64 {
+    use mmap_flags::*;
+    if flags & MAP_ANONYMOUS == 0 || fd as i64 != -1 {
+        return errno::EINVAL;
+    }
+    if len == 0 {
+        return errno::EINVAL;
+    }
+    match crate::sched::proc_mmap(len as usize, prot & PROT_WRITE != 0) {
+        Some(addr) => addr as i64,
+        None => errno::ENOMEM,
+    }
+}
+
+/// munmap(addr, len) - Unmap and free pages the calling process mapped
+/// via `mmap`.
+#[cfg(feature = "elf-loader")]
+fn sys_munmap(addr: u64, len: u64) -> i64 {
+    if crate::sched::proc_munmap(addr, len as usize) {
+        0
+    } else {
+        errno::EINVAL
+    }
+}
+
+/// brk(addr) - Grow or shrink the calling process's heap; `addr == 0`
+/// queries the current break. Always returns the resulting break (never
+/// a negative errno — matches the real `brk()` ABI).
+#[cfg(feature = "elf-loader")]
+fn sys_brk(addr: u64) -> i64 {
+    crate::sched::proc_brk(addr) as i64
 }
 
 /// klog(buf, len) - Write directly to kernel log (basicos-specific).
@@ -577,19 +701,21 @@ fn sys_klog(buf: u64, len: u64) -> i64 {
 }
 
 /// tree(target) - Recursively list a mounted FAT32 filesystem to the
-/// kernel log (basicos-specific). `target` is `tree_target::DISK` or
-/// `tree_target::INITRD`.
+/// kernel log (basicos-specific). `target` is one of `tree_target`'s
+/// `DISK`/`INITRD`/`RAMDISK` constants.
 ///
 /// Ring 3 can't walk the filesystem itself — no port I/O, no access to
 /// the kernel heap or the `fs::Fat32Fs` handle — so this does the whole
 /// walk in kernel mode and just reports success/failure back to userspace.
 #[cfg(feature = "storage")]
 fn sys_tree(target: u64) -> i64 {
-    let (label, result) = match target {
-        tree_target::DISK => ("disk", fs::with_disk(|f| print_tree(f, "/", 0))),
-        tree_target::INITRD => ("initrd", fs::with_initrd(|f| print_tree(f, "/", 0))),
+    let (label, drive) = match target {
+        tree_target::DISK => ("disk", fs::Drive::Disk),
+        tree_target::INITRD => ("initrd", fs::Drive::Initrd),
+        tree_target::RAMDISK => ("ramdisk", fs::Drive::Ramdisk),
         _ => return errno::EINVAL,
     };
+    let result = fs::with_drive(drive, |f| print_tree(f, "/", 0));
     match result {
         Some(Ok(())) => 0,
         Some(Err(e)) => {
@@ -625,6 +751,10 @@ fn print_tree(fs: &mut fs::Fat32Fs, path: &str, depth: usize) -> Result<(), fs::
         }
     }
     Ok(())
+}
+
+fn sys_kpanic() -> i64 {
+    panic!("Test panic invoked from usermode");
 }
 
 // ============================================================================

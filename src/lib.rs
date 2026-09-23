@@ -10,14 +10,19 @@
 #[cfg(feature = "heap")]
 extern crate alloc;
 
-use core::panic::PanicInfo;
-
 mod arch;
 mod drivers;
+#[cfg(feature = "elf-loader")]
+mod elf;
 #[cfg(feature = "storage")]
 mod fs;
 mod log;
 mod mem;
+mod panic;
+#[cfg(feature = "scheduler")]
+mod sched;
+#[cfg(feature = "shell")]
+mod shell;
 mod sync;
 #[cfg(feature = "usermode-demo")]
 mod syscall;
@@ -30,9 +35,9 @@ pub use log::{LogLevel, RateLimiter};
 pub use syscall::nr as syscall_nr;
 
 // Convenient aliases for internal use
-use arch::{cpu_info, gdt, interrupts};
 #[cfg(feature = "usermode-demo")]
 use arch::x86_64::syscall as arch_syscall;
+use arch::{cpu_info, gdt, interrupts};
 use drivers::{serial, vga};
 
 /// Entry point called from assembly.
@@ -52,10 +57,10 @@ pub extern "C" fn kernel_main(magic: u64, mb_info_addr: u64) -> ! {
 
     // Verify multiboot2 magic
     if magic as u32 != mem::multiboot2::MULTIBOOT2_BOOTLOADER_MAGIC {
-        pr_emerg!("Invalid multiboot2 magic: {:#x}", magic);
-        loop {
-            unsafe { core::arch::asm!("cli", "hlt") };
-        }
+        panic!("Invalid multiboot2 magic: {:#x}", magic);
+        // loop {
+        //     unsafe { core::arch::asm!("cli", "hlt") };
+        // }
     }
 
     // Parse multiboot2 memory map and initialize frame allocator
@@ -89,6 +94,14 @@ pub extern "C" fn kernel_main(magic: u64, mb_info_addr: u64) -> ! {
         mem::frame::reserve_range(module.start as usize, module.end as usize);
     }
 
+    // Same idea for the fixed-address process zone: reserve it before
+    // the heap (below) claims frames dynamically, so the two can never
+    // overlap, and before `demote_process_zone` below hands out frames
+    // for its own page tables. See `mem::paging`'s module docs on
+    // `PROC_ZONE_START` for why this range is special.
+    #[cfg(feature = "elf-loader")]
+    mem::frame::reserve_range(mem::paging::PROC_ZONE_START, mem::paging::PROC_ZONE_END);
+
     // Initialize paging system
     #[cfg(feature = "paging")]
     {
@@ -96,25 +109,38 @@ pub extern "C" fn kernel_main(magic: u64, mb_info_addr: u64) -> ! {
         pr_info!("Paging initialized");
     }
 
+    // Turn the process zone's huge-page mapping into real 4 KiB page
+    // tables, so each process (`sched::spawn_process`/`fork`) can get its
+    // own private mapping there. Must come after `paging::init()` (needs
+    // the kernel's own page tables) and the reservation above (needs
+    // `frame::allocate()` to never hand out a frame from inside the zone
+    // for its own bookkeeping).
+    #[cfg(feature = "elf-loader")]
+    mem::paging::demote_process_zone();
+
     unsafe { gdt::init() };
     pr_info!("GDT + TSS loaded");
 
     #[cfg(feature = "heap")]
     {
-        mem::heap::init();
+        let heap_size = mem::heap::init();
         pr_info!(
-            "Heap allocator initialized ({} KiB)",
-            mem::heap::HEAP_SIZE / 1024
+            "Heap allocator initialized ({} MiB)",
+            heap_size / (1024 * 1024)
         );
     }
 
-    // Mount storage: the primary ATA disk (if present) and the initrd
-    // (if GRUB loaded one). Both are FAT32 — see `fs::fat32`.
+    // Mount storage — three DOS-style drives, all FAT32 (see `fs`):
+    // A: a fresh writable ramdisk, B: the initrd (if GRUB loaded one),
+    // C: the primary ATA disk (if present).
     #[cfg(feature = "storage")]
     {
-        match fs::init_disk() {
-            Ok(()) => pr_info!("Disk: mounted FAT32 volume on primary ATA drive"),
-            Err(e) => pr_warn!("Disk: {}", e),
+        match fs::init_ramdisk() {
+            Ok(()) => pr_info!(
+                "A: formatted + mounted a {} KiB FAT32 ramdisk",
+                fs::ramdisk::TOTAL_SECTORS * fs::BLOCK_SIZE / 1024
+            ),
+            Err(e) => pr_warn!("A: {}", e),
         }
         match initrd_module {
             Some(module) => {
@@ -123,12 +149,16 @@ pub extern "C" fn kernel_main(magic: u64, mb_info_addr: u64) -> ! {
                 let bytes = unsafe { module.as_slice() };
                 match fs::init_initrd(bytes) {
                     Ok(()) => {
-                        pr_info!("initrd: mounted FAT32 image ({} KiB)", bytes.len() / 1024)
+                        pr_info!("B: mounted FAT32 initrd image ({} KiB)", bytes.len() / 1024)
                     }
-                    Err(e) => pr_warn!("initrd: {}", e),
+                    Err(e) => pr_warn!("B: {}", e),
                 }
             }
-            None => pr_info!("initrd: no module supplied by bootloader"),
+            None => pr_info!("B: no initrd module supplied by bootloader"),
+        }
+        match fs::init_disk() {
+            Ok(()) => pr_info!("C: mounted FAT32 volume on primary ATA drive"),
+            Err(e) => pr_warn!("C: {}", e),
         }
     }
 
@@ -146,7 +176,26 @@ pub extern "C" fn kernel_main(magic: u64, mb_info_addr: u64) -> ! {
     let brand = cpu_info::get_cpu_brand();
     pr_info!("CPU: {} - {}", vendor.as_str(), brand.as_str());
 
-    #[cfg(feature = "usermode-demo")]
+    // `scheduler` takes over the boot tail when it's on: it and the
+    // direct ring-3 jump below don't compose (see `sched`'s module
+    // docs for why), and a scheduler with an interactive shell is
+    // strictly more useful than a demo that runs once and halts.
+    #[cfg(feature = "scheduler")]
+    {
+        sched::spawn("task-a", sched::demo_task_a);
+        sched::spawn("task-b", sched::demo_task_b);
+        // Not usermode::user_mode_stub here — it's a ring-3 program (its
+        // first `syscall`'s `sysretq` forces CPL 3 unconditionally), and
+        // a scheduler task is ring 0 by construction; see the comment at
+        // the end of `usermode::user_mode_stub` for exactly how that
+        // combination breaks the moment it touches anything privileged.
+        #[cfg(feature = "shell")]
+        sched::spawn("shell", shell::shell_task);
+        pr_info!("Scheduler: starting round-robin");
+        sched::run();
+    }
+
+    #[cfg(all(not(feature = "scheduler"), feature = "usermode-demo"))]
     {
         pr_notice!("Jumping to ring 3...");
         let stack_top =
@@ -154,7 +203,7 @@ pub extern "C" fn kernel_main(magic: u64, mb_info_addr: u64) -> ! {
         unsafe { gdt::jump_to_ring3(usermode::user_mode_stub, stack_top) }
     }
 
-    #[cfg(not(feature = "usermode-demo"))]
+    #[cfg(all(not(feature = "scheduler"), not(feature = "usermode-demo")))]
     {
         pr_notice!("Boot sequence complete (usermode-demo disabled) — halting.");
         loop {
@@ -172,21 +221,3 @@ struct UserStack([u8; USER_STACK_SIZE]);
 
 #[cfg(feature = "usermode-demo")]
 static mut USER_STACK: UserStack = UserStack([0; USER_STACK_SIZE]);
-
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    pr_emerg!("KERNEL PANIC!");
-    if let Some(location) = info.location() {
-        pr_emerg!(
-            "  at {}:{}:{}",
-            location.file(),
-            location.line(),
-            location.column()
-        );
-    }
-    pr_emerg!("  {}", info.message());
-
-    loop {
-        unsafe { core::arch::asm!("cli", "hlt") };
-    }
-}

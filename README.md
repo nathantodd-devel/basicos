@@ -23,12 +23,26 @@ jump.
 - **Kernel log** (`log.rs`) — `printk`-style leveled logging (`pr_emerg!` …
   `pr_debug!`) with prefixes, a ring buffer, runtime log-level filtering, and
   independently toggleable VGA/serial sinks.
-- **Drivers** (`drivers/`) — VGA text-mode console, 16550 serial port, and a
-  PS/2 keyboard driver (scancode set 1 → ASCII).
+- **Drivers** (`drivers/`) — VGA text-mode console, 16550 serial port, a
+  PS/2 keyboard driver (scancode set 1 → ASCII), and an ATA (PIO) disk driver.
+- **Storage** (`fs/`) — a hand-rolled FAT32 (read/write, no LFN) over any
+  block device: the ATA disk, the read-only initrd, or a writable in-memory
+  ramdisk formatted from scratch at boot. DOS-style drive letters (`A:` the
+  ramdisk, `B:` the initrd, `C:` the disk) pick between them.
 - **Sync primitives** (`sync/`) — a spinlock and a lock-free ring buffer used
   by the logging subsystem.
 - **Usermode stub** (`usermode/`) — a minimal ring-3 entry point used to prove
   the privilege-level jump and syscall path work end to end.
+- **Scheduler** (`sched/`) — process/task abstraction for ring-0 kernel
+  threads, with a real preemptive round-robin scheduler (an xv6-style minimal
+  context switch, triggered from the timer IRQ, not just cooperative
+  yielding).
+- **Shell** (`shell/`) — a small interactive command shell (`help`, `ls`,
+  `cat`, `run`, ...) running as a scheduler task, over serial or the keyboard.
+- **ELF loader** (`elf/`) — parses a standalone ET_EXEC/x86_64 binary, loads
+  its PT_LOAD segments, and jumps to it in ring 3 (the shell's `run`
+  command). `testprog.s`/`testprog.ld` build a real test binary, entirely
+  outside the kernel image, to exercise it against.
 
 None of this is meant to be production-grade — it's a from-scratch
 exploration of what a kernel needs to do to get from firmware to ring 3.
@@ -46,12 +60,15 @@ module and nothing references it.
 | `heap` | `mem::heap`, the `#[global_allocator]` — pulls in `alloc` |
 | `frame-alloc` | `mem::frame`, the physical frame allocator |
 | `paging` | `mem::paging`, the virtual memory manager (implies `frame-alloc`) |
-| `storage` | ATA driver + FAT32 + initrd, and the syscalls that use them — `open`/`close`/`lseek`/`getdents64`, the file-backed paths of `read`/`write`, and `tree` (implies `heap` + `frame-alloc`) |
+| `storage` | ATA driver + FAT32 + initrd + a writable in-memory ramdisk (`A:`/`B:`/`C:` — see below), and the syscalls that use them — `open`/`close`/`lseek`/`getdents64`, the file-backed paths of `read`/`write`, and `tree` (implies `heap` + `frame-alloc`) |
 | `keyboard` | PS/2 keyboard driver + IRQ1 wiring |
 | `serial-input` | Serial (COM1) *input* — output (kernel logging) is always on |
 | `pit-100hz` | Reprogram the PIT to 100 Hz; off = its ~18.2 Hz power-on default |
 | `apic` | Local APIC driver (`arch::x86_64::apic`) — not wired into boot either way; available infrastructure |
 | `usermode-demo` | SYSCALL/SYSRET setup, the syscall dispatch table, and the ring-3 demo program that exercises it |
+| `scheduler` | Process/task abstraction + preemptive round-robin scheduler for ring-0 kernel threads (`sched/`) — takes over kernel_main's boot tail from `usermode-demo` when both are on |
+| `shell` | The interactive shell (`shell/`) — implies `scheduler`, since it runs as a task |
+| `elf-loader` | ELF64 loader + one-shot ring-3 exec (`elf/`), used by the shell's `run` command (implies `usermode-demo` + `storage`) |
 
 Build a reduced kernel with `--no-default-features --features <list>`, or
 override the Makefile's `FEATURES` variable:
@@ -60,10 +77,13 @@ override the Makefile's `FEATURES` variable:
 make FEATURES="--no-default-features --features heap,keyboard"
 ```
 
-Disabling `usermode-demo` (or `storage` alone, which the demo detects and
-skips) is the most visible change — the kernel finishes its boot sequence
-and just halts instead of jumping to ring 3. See `[features]` in
-`Cargo.toml` for the exact dependency graph.
+With `scheduler` on (the default), the kernel drops into an interactive
+shell after boot instead of running the fixed `usermode-demo` program — the
+two don't compose (see `sched`'s module docs for why a ring-3 program can't
+safely be a scheduler task yet). Disabling both `scheduler` and
+`usermode-demo` is the most visible change from there — the kernel finishes
+its boot sequence and just halts. See `[features]` in `Cargo.toml` for the
+exact dependency graph.
 
 ## Requirements
 
@@ -93,6 +113,33 @@ Kernel log output goes to both the VGA console and the serial port; `make
 run` wires QEMU's serial to your terminal (`-serial stdio`) so `pr_info!` etc.
 show up there.
 
+### Reproducible build in a container
+
+Don't want to install the toolchain (nightly Rust, GRUB, mtools, ...)? One
+script builds everything inside a container and drops a self-contained
+release folder on the host:
+
+```sh
+./docker-build.sh                        # -> ./release/
+./docker-build.sh -o /some/dir           # somewhere else
+./docker-build.sh --features heap,keyboard   # reduced kernel (see Cargo features)
+./docker-build.sh --no-cache             # force a full rebuild
+```
+
+It uses Docker if the daemon is reachable, otherwise rootless Podman
+(`ENGINE=podman|docker` to force one). The release folder contains
+`basicos.iso` (bootable), `kernel.bin` (stripped), `initrd.img`,
+`testprog.elf`, `disk.img.gz` (the 2 GiB `C:` test disk, gzipped — it's
+almost all zeros), `run.sh`, `BUILD-INFO.txt`, and `SHA256SUMS`. To try it:
+
+```sh
+cd release && ./run.sh        # needs qemu-system-x86_64
+```
+
+The container pins a specific dated nightly (this kernel uses unstable
+features, so a floating `nightly` can break it); bump it with
+`RUST_TOOLCHAIN=nightly-YYYY-MM-DD ./docker-build.sh` when you're ready to.
+
 ## Project layout
 
 ```
@@ -100,21 +147,28 @@ entrypoint.s         Multiboot2 header, long-mode bring-up, jump into Rust
 linker.ld            Link script (kernel loaded at 1 MiB)
 grub.cfg             GRUB menu entry for the ISO
 x86_64-basicos.json  Custom bare-metal target spec
+testprog.s/.ld       Standalone test ELF binary for exercising elf::load
 src/
   lib.rs             kernel_main: boot sequence, panic handler
   log.rs             printk-style logging + ring buffer
   arch/x86_64/       GDT/TSS, IDT, PIC, SYSCALL/SYSRET, CPUID info, port I/O
-  drivers/           VGA, serial, keyboard
+  drivers/           VGA, serial, keyboard, ATA
+  fs/                FAT32 on any BlockDevice (disk, initrd, or the ramdisk);
+                     A:/B:/C: drive-letter resolution (fs::resolve_path)
+  mem/               frame allocator, paging, heap allocator, multiboot2
   sync/              spinlock, ring buffer
   syscall/           syscall dispatch table
-  usermode/          ring-3 entry stub
+  usermode/          ring-3 entry stub (usermode-demo)
+  sched/             process/task abstraction + round-robin scheduler
+  shell/             interactive command shell
+  elf/               ELF64 loader
 ```
 
 ## Status / roadmap
 
 This is a work in progress. See [`todo.md`](todo.md) for the running list —
-physical/virtual memory management, a heap allocator, a real scheduler and
-process model, storage/filesystem support, and CI are all still open.
+a real filesystem-backed shell now exists, and CI, networking, and turning
+loaded ELF binaries into real (returning) scheduler tasks are still open.
 
 ## License
 

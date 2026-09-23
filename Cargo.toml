@@ -3,6 +3,8 @@ name = "basicos"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+
 [lib]
 name = "basicos"
 crate-type = ["staticlib"]
@@ -22,6 +24,9 @@ default = [
     "pit-100hz",
     "apic",
     "usermode-demo",
+    "scheduler",
+    "shell",
+    "elf-loader",
 ]
 
 # Heap allocator (`#[global_allocator]`, `mem::heap`) — pulls in `alloc`.
@@ -37,10 +42,13 @@ frame-alloc = []
 # already sets up (that part isn't gated; it's assembly, not Cargo).
 paging = ["frame-alloc"]
 
-# ATA (PIO) disk driver + FAT32 + initrd, and the syscalls that use them
-# (open/close/lseek/getdents64, the file-backed paths of read/write, and
-# the basicos-specific `tree` syscall). Needs `alloc` for FAT32's
-# in-memory buffers and `frame-alloc` to reserve the initrd's memory.
+# ATA (PIO) disk driver + FAT32 + initrd + a writable in-memory ramdisk,
+# and the syscalls that use them (open/close/lseek/getdents64, the
+# file-backed paths of read/write, and the basicos-specific `tree`
+# syscall). DOS-style drive letters address the three: `A:` the
+# ramdisk, `B:` the initrd, `C:` the main disk (see `fs::resolve_path`).
+# Needs `alloc` for FAT32's in-memory buffers and the ramdisk's own
+# backing store, and `frame-alloc` to reserve the initrd's memory.
 storage = ["heap", "frame-alloc"]
 
 # PS/2 keyboard driver: scancode decoding, modifier tracking, the input
@@ -67,9 +75,41 @@ apic = []
 
 # The ring-3 jump: SYSCALL/SYSRET MSR setup, the syscall dispatch table,
 # and `usermode::user_mode_stub`, which exercises it (including a
-# storage demo, if `storage` is also enabled). Off = kernel_main sets
+# storage demo, if `storage` is also enabled). Superseded at boot by
+# `scheduler` when that's also on (see below) — off = kernel_main sets
 # everything up and then just halts, no ring-3 code ever runs.
 usermode-demo = []
+
+# Process/task abstraction + a preemptive round-robin scheduler for
+# ring-0 kernel threads (see `sched`) — real tasks, a real minimal
+# context switch (xv6-style: only the callee-saved registers + RSP),
+# preempted every PIT tick from the timer IRQ, not just cooperative.
+# When this is on, kernel_main hands off to `sched::run()` (spawning a
+# couple of demo tasks that prove preemption, plus the shell task if
+# `shell` is also on) *instead of* the plain `usermode-demo` ring-3 jump
+# — the two don't compose (see `sched`'s docs for why), and an
+# interactive shell is the more useful default. `usermode-demo`'s own
+# boot path still runs as before if `scheduler` is off.
+scheduler = []
+
+# An interactive command shell (builtins: help/echo/ls/cat/meminfo/
+# uptime/ps/run/clear), reading from serial if `serial-input` is on,
+# else the keyboard if `keyboard` is on, else it just sits idle. Runs as
+# a scheduler task, so this implies `scheduler`.
+shell = ["scheduler"]
+
+# ELF64 loader: parses an ET_EXEC binary and copies its PT_LOAD segments
+# into a process's own address space (`mem::paging`'s process zone —
+# each process gets its own private physical backing at the same fixed
+# virtual range). Also where `fork`/`execve`/`wait`/`mmap`/`brk` live
+# (see `sched`'s module docs) — needs `usermode-demo` for the ring-3/
+# syscall machinery, `storage` to read a binary off disk, and `paging`
+# for the per-process address spaces themselves.
+elf-loader = ["usermode-demo", "storage", "paging"]
+
+
+bad-interrupt-panic = []
+
 
 [profile.dev]
 panic = "abort"

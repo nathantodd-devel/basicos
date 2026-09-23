@@ -55,11 +55,35 @@ unsafe fn wrmsr(msr: u32, value: u64) {
     );
 }
 
+/// The kernel-mode stack `syscall_entry` switches to. Read fresh on every
+/// `syscall` instruction, so whichever task is actually running gets its
+/// *own* stack rather than everyone sharing one — the scheduler calls
+/// [`set_kernel_stack_top`] on every switch to keep this current,
+/// mirroring `gdt::set_kernel_stack`'s TSS.RSP0 (same idea, two
+/// mechanisms: TSS.RSP0 is consulted by the CPU on interrupts/exceptions,
+/// this is consulted by our own `syscall_entry` code). Initialized in
+/// [`init`] to `SYSCALL_STACK`'s top, so the boot-time `usermode-demo`
+/// path (no scheduler, nobody else ever calls `set_kernel_stack_top`)
+/// keeps working exactly as before.
+#[no_mangle]
+static mut CURRENT_KERNEL_STACK_TOP: u64 = 0;
+
+/// Point `syscall_entry` at a different kernel stack for the next
+/// `syscall` it handles. See [`CURRENT_KERNEL_STACK_TOP`].
+pub fn set_kernel_stack_top(top: u64) {
+    unsafe {
+        CURRENT_KERNEL_STACK_TOP = top;
+    }
+}
+
 /// Initialize SYSCALL/SYSRET support.
 ///
 /// # Safety
 /// Must be called after GDT is set up, from kernel mode.
 pub unsafe fn init() {
+    CURRENT_KERNEL_STACK_TOP =
+        core::ptr::addr_of!(SYSCALL_STACK.0) as u64 + SYSCALL_STACK_SIZE as u64;
+
     // Enable SCE (System Call Extensions) in EFER
     let efer = rdmsr(IA32_EFER);
     wrmsr(IA32_EFER, efer | EFER_SCE);
@@ -111,8 +135,11 @@ extern "C" fn syscall_entry() {
         // for arg4-6, which was fine while nothing needed them.
         "mov [{user_rsp}], rsp",
 
-        // Load kernel stack from our static
-        "lea rsp, [{kernel_stack} + {stack_size}]",
+        // Switch to whichever task is actually running's own kernel
+        // stack (see `CURRENT_KERNEL_STACK_TOP`'s doc comment) — not a
+        // fixed symbol, so two different processes handling syscalls
+        // don't corrupt each other's saved state.
+        "mov rsp, [{stack_top}]",
 
         // Build a syscall frame on the kernel stack
         // Save user state
@@ -136,6 +163,16 @@ extern "C" fn syscall_entry() {
         // so arg4 is still sitting there. Each line below reads a
         // register before overwriting it, so this is safe in this order.
         "push r9",      // arg6 -> stack (7th C-ABI arg)
+
+        // Snapshot RSP now, with the full 10-qword frame
+        // [arg6,r15,r14,r13,r12,rbp,rbx,r11,rcx,user_rsp] sitting right
+        // above it (see `SyscallFrame`) — `fork()` copies this to seed a
+        // child's resume state, `execve()` overwrites rip/user_rsp/rflags
+        // in place to redirect where this syscall returns to. Nothing
+        // below here touches RSP again until the matching pops in
+        // `syscall_return_to_user`.
+        "mov [{frame_ptr}], rsp",
+
         "mov r9, r8",   // arg5 -> r9
         "mov r8, r10",  // arg4 -> r8
         "mov rcx, rdx", // arg3
@@ -149,35 +186,117 @@ extern "C" fn syscall_entry() {
         // Call the Rust syscall dispatcher
         "call {syscall_dispatch}",
 
-        // Disable interrupts for sysret
+        // RAX already contains return value from syscall_dispatch.
+        // `syscall_return_to_user` (shared with `fork_child_entry`, see
+        // its doc comment) does the rest: disable interrupts, pop the
+        // frame `{frame_ptr}` points at, sysretq.
+        "jmp {tail}",
+
+        user_rsp = sym USER_RSP_SCRATCH,
+        stack_top = sym CURRENT_KERNEL_STACK_TOP,
+        frame_ptr = sym CURRENT_SYSCALL_FRAME,
+        syscall_dispatch = sym crate::syscall::dispatch,
+        tail = sym syscall_return_to_user,
+    );
+}
+
+/// Shared tail of every return to ring 3: disable interrupts, pop the
+/// 10-qword frame at the top of the current kernel stack (arg6 discarded,
+/// then the same layout `SyscallFrame` describes), `sysretq`.
+///
+/// Two callers land here: `syscall_entry` falls straight through after
+/// `dispatch()` returns normally (RAX already holds its return value),
+/// and [`fork_child_entry`] jumps here as a *forked child's* very first
+/// instruction, with RSP planted by `sched`'s fork support pointing at a
+/// copy of the parent's frame instead of a frame `dispatch()` actually
+/// built — indistinguishable to this code either way, which is the
+/// point: a forked child resumes exactly like an ordinary syscall return,
+/// just with someone else's stack under it and RAX forced to 0.
+#[unsafe(naked)]
+pub extern "C" fn syscall_return_to_user() {
+    naked_asm!(
         "cli",
-
-        // Clean up arg6 from stack
-        "add rsp, 8",
-
-        // Restore callee-saved registers
+        "add rsp, 8", // discard arg6
         "pop r15",
         "pop r14",
         "pop r13",
         "pop r12",
         "pop rbp",
         "pop rbx",
-
-        // Restore user state for sysret
-        "pop r11",      // user RFLAGS
-        "pop rcx",      // user RIP
-        "pop rsp",      // user RSP
-
-        // RAX already contains return value from syscall_dispatch
-
-        // Return to user mode
+        "pop r11", // user RFLAGS
+        "pop rcx", // user RIP
+        "pop rsp", // user RSP
         "sysretq",
-
-        user_rsp = sym USER_RSP_SCRATCH,
-        kernel_stack = sym SYSCALL_STACK,
-        stack_size = const SYSCALL_STACK_SIZE,
-        syscall_dispatch = sym crate::syscall::dispatch,
     );
+}
+
+/// A forked child's planted first instruction (see `sched`'s fork
+/// support): zero RAX — `fork()` returns 0 in the child — then fall into
+/// the same frame-restoring tail an ordinary syscall return uses. RSP at
+/// entry already points at the copied `SyscallFrame`; `sched` is
+/// responsible for arranging that before this ever runs.
+#[unsafe(naked)]
+pub extern "C" fn fork_child_entry() {
+    naked_asm!(
+        "xor eax, eax",
+        "jmp {tail}",
+        tail = sym syscall_return_to_user,
+    );
+}
+
+/// The syscall-entry register frame `syscall_entry` builds on the kernel
+/// stack before calling `dispatch()` — see the `mov [{frame_ptr}], rsp`
+/// comment there for exactly which instant this is captured at. Field
+/// order matches push order exactly (this is `#[repr(C)]` precisely so
+/// the two stay in sync); `rflags`/`rip` are named for what they hold
+/// (R11/RCX at syscall entry), not the registers themselves.
+#[repr(C)]
+pub struct SyscallFrame {
+    pub arg6: u64,
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub rbp: u64,
+    pub rbx: u64,
+    pub rflags: u64,
+    pub rip: u64,
+    pub user_rsp: u64,
+}
+
+/// Set by `syscall_entry` on every syscall; valid only while a syscall
+/// handler is actually running. See `SyscallFrame` and the `mov
+/// [{frame_ptr}], rsp` line above.
+#[no_mangle]
+static mut CURRENT_SYSCALL_FRAME: u64 = 0;
+
+/// The currently in-flight syscall's register frame. `fork()` reads it to
+/// seed a child's resume state; `execve()` overwrites `rip`/`user_rsp`/
+/// `rflags` in place to redirect where this syscall returns to instead of
+/// back into the old program.
+///
+/// # Safety
+/// Only valid while called from within a syscall handler (i.e. from code
+/// reachable from `dispatch()`).
+///
+/// **Call this as early as possible in whatever handler needs it, and
+/// hold onto the *pointer*, not a reason to call this again later.** It
+/// reads one global that `syscall_entry` overwrites on every single
+/// syscall, from any task — interrupts are enabled for the whole
+/// dispatch (`syscall_entry`'s own `sti`), so a timer tick can preempt
+/// mid-handler and hand the CPU to a different task, which might make a
+/// syscall of its own before this one resumes. A second call after that
+/// point returns *that* task's frame, not this call's own, with nothing
+/// to indicate anything went wrong — the pointee itself (a fixed spot on
+/// the calling task's own kernel stack) never moves, so capturing the
+/// pointer once, up front, and reusing it is entirely sound; re-deriving
+/// it from this global partway through a long handler is the actual
+/// hazard. `sched::fork_current`/`exec_current` are the two existing
+/// examples — both capture this before doing any of their own
+/// preemptible work (page-table walks, many individual
+/// `frame::allocate()` calls) for exactly this reason.
+pub unsafe fn current_frame() -> *mut SyscallFrame {
+    CURRENT_SYSCALL_FRAME as *mut SyscallFrame
 }
 
 /// One-slot scratch space for stashing the user's RSP across the stack

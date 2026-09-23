@@ -5,13 +5,22 @@
 #   make release      - build optimized, stripped release ISO
 #   make run          - boot debug ISO in QEMU, with the test disk attached
 #   make run-release  - boot release ISO in QEMU, with the test disk attached
+#   make gdb          - boot debug ISO in QEMU, halted, waiting for GDB on :1234
 #   make disk         - create build/disk.img (2G, FAT32) if it doesn't exist
 #   make disk-reset   - wipe and recreate build/disk.img from scratch
 #   make initrd       - create build/initrd.img (FAT32 initrd) if it doesn't exist
 #   make initrd-reset - wipe and recreate build/initrd.img from scratch
 #   make reset-disks  - disk-reset + initrd-reset
+#   make userland     - build userland/*.c (see userland/Makefile)
 #   make clean        - remove build artifacts
 #   make size         - show kernel binary sizes
+#
+# Debugging with GDB: `make gdb` in one terminal, `gdb -x debug.gdb` in
+# another — see debug.gdb's own header for what that sets up. The debug
+# build keeps full DWARF info (only [profile.release] strips it), and
+# -C force-frame-pointers=yes is set kernel-wide (.cargo/config.toml),
+# so both GDB's `bt` and the kernel's own panic handler (`src/panic.rs`)
+# produce real backtraces.
 #
 # Every optional subsystem (heap, paging, storage, keyboard, ...) is a
 # Cargo feature, on by default. Build a reduced kernel with FEATURES:
@@ -64,12 +73,30 @@ DISK_SIZE   := 2G
 INITRD_IMG  := $(BUILD_DIR)/initrd.img
 INITRD_SIZE := 8M
 
+# Standalone test ELF binaries for the `elf-loader` feature. testprog.s
+# is copied onto $(DISK_IMG) as /hello.elf; forktest.s (fork/exec/wait/
+# mmap/brk, execve'ing into hello.elf on success) as /forktest.elf.
+TESTPROG_OBJ := $(BUILD_DIR)/testprog.o
+TESTPROG_ELF := $(BUILD_DIR)/testprog.elf
+FORKTEST_OBJ := $(BUILD_DIR)/forktest.o
+FORKTEST_ELF := $(BUILD_DIR)/forktest.elf
+
+# userland/: the same idea, but built from C (see userland/syscalls.h
+# and userland/Makefile) instead of hand-written assembly. Every
+# userland/*.c program that builds gets copied onto $(DISK_IMG) as
+# C:\testprogs\<name>.elf — under its own directory rather than
+# alongside testprog/forktest's /hello.elf and /forktest.elf, since
+# forkexec.elf execve's into the *assembly*-built /hello.elf on purpose
+# (see its header comment) and the two shouldn't be mixed up.
+USERLAND_DIR := userland
+
 # -boot d: always boot the CD, regardless of the attached hard drive —
 # without it QEMU can try the hard drive first once one is attached.
 QEMU_FLAGS  := -m 256M -serial stdio -boot d -drive file=$(DISK_IMG),format=raw,if=ide,index=0
 
-.PHONY: all debug release kernel kernel-release iso iso-release run run-release \
-        disk disk-reset initrd initrd-reset reset-disks clean size FORCE
+.PHONY: all debug release kernel kernel-release iso iso-release run run-release gdb \
+        disk disk-reset initrd initrd-reset reset-disks testprog forktest userland \
+        clean size FORCE
 
 all: iso
 
@@ -141,15 +168,51 @@ iso-release: kernel-release initrd
 # wipes and repopulates both from scratch — use it if a test run has
 # left the disk in a state you don't want to keep debugging against.
 
-$(DISK_IMG):
+$(DISK_IMG): $(TESTPROG_ELF) $(FORKTEST_ELF) userland
 	mkdir -p $(BUILD_DIR)
 	$(QEMU_IMG) create -f raw $(DISK_IMG) $(DISK_SIZE)
 	$(MKFS_VFAT) -F 32 -n BASICOS $(DISK_IMG)
 	echo "hello from the FAT32 test disk" | $(MCOPY) -i $(DISK_IMG) - ::/hello.txt
 	mmd -i $(DISK_IMG) ::/docs
 	echo "just some docs on the test disk" | $(MCOPY) -i $(DISK_IMG) - ::/docs/readme.txt
+	$(MCOPY) -i $(DISK_IMG) $(TESTPROG_ELF) ::/hello.elf
+	$(MCOPY) -i $(DISK_IMG) $(FORKTEST_ELF) ::/forktest.elf
+	mmd -i $(DISK_IMG) ::/TESTPROG
+	$(MCOPY) -i $(DISK_IMG) $(USERLAND_DIR)/build/*.elf ::/TESTPROG/
 
 disk: $(DISK_IMG)
+
+# testprog.s: a tiny standalone ELF64 executable (not part of the
+# kernel) for exercising `elf::load`/`elf::run` — see its own header
+# comment. Copied onto the test disk as /hello.elf above; try it from
+# the shell with `run /hello.elf`.
+$(TESTPROG_OBJ): testprog.s | $(BUILD_DIR)
+	$(AS) --64 $< -o $@
+
+$(TESTPROG_ELF): $(TESTPROG_OBJ) testprog.ld
+	$(LD) -n -T testprog.ld -o $(TESTPROG_ELF) $(TESTPROG_OBJ)
+
+testprog: $(TESTPROG_ELF)
+
+# forktest.s: exercises fork/execve/wait4/mmap/brk — see its own header
+# comment. Copied onto the test disk as /forktest.elf above; try it from
+# the shell with `run /forktest.elf`.
+$(FORKTEST_OBJ): forktest.s | $(BUILD_DIR)
+	$(AS) --64 $< -o $@
+
+$(FORKTEST_ELF): $(FORKTEST_OBJ) forktest.ld
+	$(LD) -n -T forktest.ld -o $(FORKTEST_ELF) $(FORKTEST_OBJ)
+
+forktest: $(FORKTEST_ELF)
+
+# userland/: C programs against syscalls.h — see userland/Makefile for
+# the actual build rules (compiler flags, crt0, linker script) and the
+# full list of *.c files, which changes independently of this Makefile.
+# Always delegated, same reasoning as the cargo-build rules above: let
+# userland/Makefile's own dependency tracking decide what's stale.
+.PHONY: userland
+userland:
+	$(MAKE) -C $(USERLAND_DIR)
 
 disk-reset:
 	rm -f $(DISK_IMG)
@@ -181,6 +244,15 @@ run: iso disk
 run-release: iso-release disk
 	$(QEMU) -cdrom $(RELEASE_ISO) $(QEMU_FLAGS)
 
+# -S: start halted (nothing runs — not even the BIOS/GRUB boot — until a
+# debugger tells it to). -s: shorthand for -gdb tcp::1234. Always the
+# *debug* ISO: [profile.release] strips symbols, so there'd be nothing
+# for GDB to resolve against. See debug.gdb for the other half of this.
+gdb: iso disk
+	@echo "Waiting for a debugger on tcp::1234 (nothing runs until it attaches)."
+	@echo "In another terminal: gdb -x debug.gdb"
+	$(QEMU) -cdrom $(DEBUG_ISO) $(QEMU_FLAGS) -s -S
+
 # ============================================================================
 # Utilities
 # ============================================================================
@@ -200,3 +272,4 @@ size: kernel kernel-release
 
 clean:
 	rm -rf $(BUILD_DIR) target
+	$(MAKE) -C $(USERLAND_DIR) clean

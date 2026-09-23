@@ -1,5 +1,7 @@
 //! Exception handlers, IRQ handlers, and interrupt subsystem init.
 
+use alloc::format;
+
 #[cfg(feature = "pit-100hz")]
 use super::pit;
 #[cfg(feature = "keyboard")]
@@ -42,6 +44,8 @@ extern "x86-interrupt" fn divide_error_handler(frame: InterruptStackFrame) {
         "EXCEPTION: DIVIDE ERROR at {:#x}",
         frame.instruction_pointer
     );
+    #[cfg(feature = "bad-interrupt-panic")]
+    panic!("EXCEPTION: DIVIDE ERROR at {:#x}", frame.instruction_pointer);
     halt_loop();
 }
 
@@ -53,6 +57,8 @@ extern "x86-interrupt" fn debug_handler(frame: InterruptStackFrame) {
 extern "x86-interrupt" fn nmi_handler(frame: InterruptStackFrame) {
     pr_crit!("EXCEPTION: NMI at {:#x}", frame.instruction_pointer);
     // NMI could be hardware failure, memory parity error, etc.
+    #[cfg(feature = "bad-interrupt-panic")]
+    panic!("EXCEPTION: NMI at {:#x}", frame.instruction_pointer);
     halt_loop();
 }
 
@@ -65,11 +71,18 @@ extern "x86-interrupt" fn breakpoint_handler(frame: InterruptStackFrame) {
 
 extern "x86-interrupt" fn overflow_handler(frame: InterruptStackFrame) {
     pr_crit!("EXCEPTION: OVERFLOW at {:#x}", frame.instruction_pointer);
+    #[cfg(feature = "bad-interrupt-panic")]
+    panic!("EXCEPTION: OVERFLOW at {:#x}", frame.instruction_pointer);
     halt_loop();
 }
 
 extern "x86-interrupt" fn bound_range_handler(frame: InterruptStackFrame) {
     pr_crit!(
+        "EXCEPTION: BOUND RANGE EXCEEDED at {:#x}",
+        frame.instruction_pointer
+    );
+    #[cfg(feature = "bad-interrupt-panic")]
+    panic!(
         "EXCEPTION: BOUND RANGE EXCEEDED at {:#x}",
         frame.instruction_pointer
     );
@@ -81,11 +94,21 @@ extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
         "EXCEPTION: INVALID OPCODE at {:#x}",
         frame.instruction_pointer
     );
+    #[cfg(feature = "bad-interrupt-panic")]
+    panic!(
+        "EXCEPTION: INVALID OPCODE at {:#x}",
+        frame.instruction_pointer
+    );
     halt_loop();
 }
 
 extern "x86-interrupt" fn device_not_available_handler(frame: InterruptStackFrame) {
     pr_crit!(
+        "EXCEPTION: DEVICE NOT AVAILABLE (FPU) at {:#x}",
+        frame.instruction_pointer
+    );
+    #[cfg(feature = "bad-interrupt-panic")]
+    panic!(
         "EXCEPTION: DEVICE NOT AVAILABLE (FPU) at {:#x}",
         frame.instruction_pointer
     );
@@ -97,6 +120,14 @@ extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, error
     pr_crit!("  error_code: {:#x}", error_code);
     pr_crit!("  RIP: {:#x}", frame.instruction_pointer);
     pr_crit!("  RSP: {:#x}", frame.stack_pointer);
+    #[cfg(feature = "bad-interrupt-panic")]
+    panic!(
+        r"EXCEPTION: DOUBLE FAULT
+  error_code: {:#x}
+  RIP: {:#x}
+  RSP: {:#x}",
+        error_code, frame.instruction_pointer, frame.stack_pointer
+    );
     halt_loop();
 }
 
@@ -104,6 +135,13 @@ extern "x86-interrupt" fn invalid_tss_handler(frame: InterruptStackFrame, error_
     pr_crit!("EXCEPTION: INVALID TSS");
     pr_crit!("  error_code: {:#x}", error_code);
     pr_crit!("  RIP: {:#x}", frame.instruction_pointer);
+    #[cfg(feature = "bad-interrupt-panic")]
+    panic!(
+        r"EXCEPTION: INVALID TSS
+  error_code: {:#x}
+  RIP: {:#x}",
+        error_code, frame.instruction_pointer
+    );
     halt_loop();
 }
 
@@ -111,6 +149,13 @@ extern "x86-interrupt" fn segment_not_present_handler(frame: InterruptStackFrame
     pr_crit!("EXCEPTION: SEGMENT NOT PRESENT");
     pr_crit!("  error_code: {:#x}", error_code);
     pr_crit!("  RIP: {:#x}", frame.instruction_pointer);
+    #[cfg(feature = "bad-interrupt-panic")]
+    panic!(
+        r"EXCEPTION: SEGMENT NOT PRESENT
+  error_code: {:#x}
+  RIP: {:#x}",
+        error_code, frame.instruction_pointer
+    );
     halt_loop();
 }
 
@@ -118,6 +163,13 @@ extern "x86-interrupt" fn stack_segment_fault_handler(frame: InterruptStackFrame
     pr_crit!("EXCEPTION: STACK SEGMENT FAULT");
     pr_crit!("  error_code: {:#x}", error_code);
     pr_crit!("  RIP: {:#x}", frame.instruction_pointer);
+    #[cfg(feature = "bad-interrupt-panic")]
+    panic!(
+        r"EXCEPTION: STACK SEGMENT FAULT
+  error_code: {:#x}
+  RIP: {:#x}",
+        error_code, frame.instruction_pointer
+    );
     halt_loop();
 }
 
@@ -128,6 +180,13 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     pr_crit!("EXCEPTION: GENERAL PROTECTION FAULT");
     pr_crit!("  error_code: {:#x}", error_code);
     pr_crit!("  RIP: {:#x}", frame.instruction_pointer);
+    #[cfg(feature = "bad-interrupt-panic")]
+    panic!(
+        r"EXCEPTION: GENERAL PROTECTION FAULT
+  error_code: {:#x}
+  RIP: {:#x}",
+        error_code, frame.instruction_pointer
+    );
     halt_loop();
 }
 
@@ -136,10 +195,8 @@ extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, error_c
     unsafe {
         core::arch::asm!("mov {}, cr2", out(reg) faulting_addr, options(nomem, nostack, preserves_flags));
     }
-    pr_crit!("EXCEPTION: PAGE FAULT");
-    pr_crit!("  faulting address: {:#x}", faulting_addr);
-    pr_crit!(
-        "  error: {}{}{}{}{}",
+    let error = format!(
+        "{}{}{}{}{}",
         if error_code & 1 != 0 {
             "protection "
         } else {
@@ -166,12 +223,30 @@ extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, error_c
             ""
         }
     );
+
+    pr_crit!("EXCEPTION: PAGE FAULT");
+    pr_crit!("  faulting address: {:#x}", faulting_addr);
+    pr_crit!("  error: {}", error);
     pr_crit!("  RIP: {:#x}", frame.instruction_pointer);
+
+    #[cfg(feature = "bad-interrupt-panic")]
+    panic!(
+        "EXCEPTION: PAGE FAULT\n\
+         faulting address: {:#x}\n\
+         error: {}\n\
+         RIP: {:#x}",
+        faulting_addr, error, frame.instruction_pointer
+    );
     halt_loop();
 }
 
 extern "x86-interrupt" fn x87_fpu_error_handler(frame: InterruptStackFrame) {
     pr_crit!(
+        "EXCEPTION: x87 FPU ERROR at {:#x}",
+        frame.instruction_pointer
+    );
+    #[cfg(feature = "bad-interrupt-panic")]
+    panic!(
         "EXCEPTION: x87 FPU ERROR at {:#x}",
         frame.instruction_pointer
     );
@@ -182,11 +257,23 @@ extern "x86-interrupt" fn alignment_check_handler(frame: InterruptStackFrame, er
     pr_crit!("EXCEPTION: ALIGNMENT CHECK");
     pr_crit!("  error_code: {:#x}", error_code);
     pr_crit!("  RIP: {:#x}", frame.instruction_pointer);
+    #[cfg(feature = "bad-interrupt-panic")]
+    panic!(
+        r"EXCEPTION: ALIGNMENT CHECK
+  error_code: {:#x}
+  RIP: {:#x}",
+        error_code, frame.instruction_pointer
+    );
     halt_loop();
 }
 
 extern "x86-interrupt" fn machine_check_handler(frame: InterruptStackFrame) -> ! {
     pr_crit!(
+        "EXCEPTION: MACHINE CHECK at {:#x}",
+        frame.instruction_pointer
+    );
+    #[cfg(feature = "bad-interrupt-panic")]
+    panic!(
         "EXCEPTION: MACHINE CHECK at {:#x}",
         frame.instruction_pointer
     );
@@ -198,11 +285,21 @@ extern "x86-interrupt" fn simd_fpu_error_handler(frame: InterruptStackFrame) {
         "EXCEPTION: SIMD FLOATING POINT at {:#x}",
         frame.instruction_pointer
     );
+    #[cfg(feature = "bad-interrupt-panic")]
+    panic!(
+        "EXCEPTION: SIMD FLOATING POINT at {:#x}",
+        frame.instruction_pointer
+    );
     halt_loop();
 }
 
 extern "x86-interrupt" fn virtualization_handler(frame: InterruptStackFrame) {
     pr_crit!(
+        "EXCEPTION: VIRTUALIZATION at {:#x}",
+        frame.instruction_pointer
+    );
+    #[cfg(feature = "bad-interrupt-panic")]
+    panic!(
         "EXCEPTION: VIRTUALIZATION at {:#x}",
         frame.instruction_pointer
     );
@@ -213,11 +310,23 @@ extern "x86-interrupt" fn control_protection_handler(frame: InterruptStackFrame,
     pr_crit!("EXCEPTION: CONTROL PROTECTION");
     pr_crit!("  error_code: {:#x}", error_code);
     pr_crit!("  RIP: {:#x}", frame.instruction_pointer);
+    #[cfg(feature = "bad-interrupt-panic")]
+    panic!(
+        r"EXCEPTION: CONTROL PROTECTION
+  error_code: {:#x}
+  RIP: {:#x}",
+        error_code, frame.instruction_pointer
+    );
     halt_loop();
 }
 
 extern "x86-interrupt" fn hypervisor_injection_handler(frame: InterruptStackFrame) {
     pr_crit!(
+        "EXCEPTION: HYPERVISOR INJECTION at {:#x}",
+        frame.instruction_pointer
+    );
+    #[cfg(feature = "bad-interrupt-panic")]
+    panic!(
         "EXCEPTION: HYPERVISOR INJECTION at {:#x}",
         frame.instruction_pointer
     );
@@ -228,6 +337,13 @@ extern "x86-interrupt" fn vmm_communication_handler(frame: InterruptStackFrame, 
     pr_crit!("EXCEPTION: VMM COMMUNICATION");
     pr_crit!("  error_code: {:#x}", error_code);
     pr_crit!("  RIP: {:#x}", frame.instruction_pointer);
+    #[cfg(feature = "bad-interrupt-panic")]
+    panic!(
+        r"EXCEPTION: VMM COMMUNICATION
+  error_code: {:#x}
+  RIP: {:#x}",
+        error_code, frame.instruction_pointer
+    );
     halt_loop();
 }
 
@@ -235,6 +351,13 @@ extern "x86-interrupt" fn security_exception_handler(frame: InterruptStackFrame,
     pr_crit!("EXCEPTION: SECURITY EXCEPTION");
     pr_crit!("  error_code: {:#x}", error_code);
     pr_crit!("  RIP: {:#x}", frame.instruction_pointer);
+    #[cfg(feature = "bad-interrupt-panic")]
+    panic!(
+        r"EXCEPTION: SECURITY EXCEPTION
+  error_code: {:#x}
+  RIP: {:#x}",
+        error_code, frame.instruction_pointer
+    );
     halt_loop();
 }
 
@@ -248,7 +371,15 @@ fn halt_loop() -> ! {
 
 extern "x86-interrupt" fn timer_interrupt_handler(_frame: InterruptStackFrame) {
     TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
+    // EOI *before* a possible preemption below: `yield_now` might not
+    // return here for a while (another task could run for many ticks
+    // first), and until EOI is sent the PIC won't deliver IRQ0 again —
+    // sending it after would silently stop the clock (and preemption
+    // with it) until whatever we switched away from happens to be
+    // scheduled back in. See `sched`'s module docs for the full picture.
     unsafe { pic::send_eoi(0) };
+    #[cfg(feature = "scheduler")]
+    crate::sched::yield_now();
 }
 
 #[cfg(feature = "keyboard")]

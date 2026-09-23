@@ -1,0 +1,38 @@
+// Project-local debug tasks
+//
+// For more documentation on how to configure debug tasks,
+// see: https://zed.dev/docs/debugger
+//
+// This attaches Zed's GDB adapter to QEMU's gdbstub, the same target
+// `make gdb` + `debug.gdb` already talk to from the command line (see
+// that file's own header for the full rundown of what each GDB command
+// here is for). "build" backgrounds `make gdb` itself — which boots
+// QEMU halted with -s -S and never exits on its own — then polls
+// 127.0.0.1:1234 until the gdbstub is actually listening, so the debug
+// adapter isn't racing a cold kernel build. QEMU is left running after
+// you stop debugging; kill it yourself (or `pkill -f 'qemu-system-x86_64.*-S'`)
+// before starting another session, since a second QEMU can't rebind :1234.
+//
+// This config's field names (adapter/tcp_connection/gdb_path/gdb_args)
+// are confirmed against Zed 1.20's own binary, but the end-to-end
+// behavior — whether `tcp_connection` plus debug.gdb's own `target
+// remote` step on each other — hasn't been smoke-tested inside the
+// Zed GUI itself. If the session doesn't hit the kernel_main breakpoint
+// cleanly, that combination is the first thing to look at.
+[
+  {
+    "label": "basicos: QEMU (GDB)",
+    "adapter": "GDB",
+    "request": "launch",
+    "program": "build/kernel.bin",
+    "tcp_connection": { "host": "127.0.0.1", "port": 1234 },
+    "gdb_args": ["-x=debug.gdb"],
+    "build": {
+      "command": "bash",
+      "args": [
+        "-c",
+        "setsid make gdb > /tmp/basicos-qemu-gdb.log 2>&1 < /dev/null & for i in $(seq 1 120); do (exec 3<>/dev/tcp/127.0.0.1/1234) 2>/dev/null && exec 3<&- 3>&- && exit 0; sleep 0.5; done; echo 'timed out waiting for QEMU gdbstub on :1234 (see /tmp/basicos-qemu-gdb.log)' >&2; exit 1"
+      ]
+    }
+  }
+]
