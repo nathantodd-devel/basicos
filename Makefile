@@ -18,14 +18,24 @@
 # Debugging with GDB: `make gdb` in one terminal, `gdb -x debug.gdb` in
 # another — see debug.gdb's own header for what that sets up. The debug
 # build keeps full DWARF info (only [profile.release] strips it), and
-# -C force-frame-pointers=yes is set kernel-wide (.cargo/config.toml),
-# so both GDB's `bt` and the kernel's own panic handler (`src/panic.rs`)
-# produce real backtraces.
+# -C force-frame-pointers=yes is set kernel-wide (kernel/.cargo/
+# config.toml), so both GDB's `bt` and the kernel's own panic handler
+# (`kernel/src/panic.rs`) produce real backtraces.
 #
 # Every optional subsystem (heap, paging, storage, keyboard, ...) is a
 # Cargo feature, on by default. Build a reduced kernel with FEATURES:
 #   make FEATURES="--no-default-features --features heap,keyboard"
-# See [features] in Cargo.toml for the full list and what each gates.
+# See [features] in kernel/Cargo.toml for the full list and what each
+# gates.
+#
+# Workspace layout: kernel/ (the OS, a custom no_std target) and fs/
+# (the FAT32 format, an ordinary host-target crate kernel/ depends on
+# and a future host-side tool could too — see fs/src/lib.rs) are Cargo
+# workspace members sharing the root Cargo.toml/Cargo.lock/target/. The
+# cargo invocations below `cd kernel` first because kernel/.cargo/
+# config.toml's settings (the custom target, build-std) only apply when
+# Cargo is invoked with kernel/ as the working directory — config
+# discovery walks up from cwd, not from --manifest-path.
 
 ARCH        := x86_64
 TARGET_SPEC := x86_64-basicos
@@ -59,8 +69,9 @@ RELEASE_ISO := $(BUILD_DIR)/basicos-release.iso
 
 ASM_OBJ     := $(BUILD_DIR)/entrypoint.o
 
-# Find all Rust source files for dependency tracking
-RUST_SOURCES := $(shell find src -name '*.rs')
+# Find all Rust source files for dependency tracking — both workspace
+# members, since fs/ changes should trigger a kernel rebuild too.
+RUST_SOURCES := $(shell find kernel/src fs/src -name '*.rs')
 
 # Disk images for the ATA/FAT32 storage stack.
 # DISK_IMG is a virtual hard drive attached via `-drive` (what the ATA
@@ -94,7 +105,7 @@ USERLAND_DIR := userland
 # without it QEMU can try the hard drive first once one is attached.
 QEMU_FLAGS  := -m 256M -serial stdio -boot d -drive file=$(DISK_IMG),format=raw,if=ide,index=0
 
-.PHONY: all debug release kernel kernel-release iso iso-release run run-release gdb \
+.PHONY: all debug release kernel-bin kernel-release iso iso-release run run-release gdb \
         disk disk-reset initrd initrd-reset reset-disks testprog forktest userland \
         clean size FORCE
 
@@ -117,35 +128,39 @@ release: iso-release
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-$(ASM_OBJ): entrypoint.s | $(BUILD_DIR)
+$(ASM_OBJ): kernel/entrypoint.s | $(BUILD_DIR)
 	$(AS) --64 $< -o $@
 
 # ============================================================================
 # Debug Build
 # ============================================================================
 
-$(DEBUG_LIB): $(RUST_SOURCES) Cargo.toml $(TARGET_SPEC).json .cargo/config.toml FORCE
-	$(CARGO) -Zjson-target-spec build $(FEATURES)
+$(DEBUG_LIB): $(RUST_SOURCES) kernel/Cargo.toml fs/Cargo.toml kernel/$(TARGET_SPEC).json kernel/.cargo/config.toml FORCE
+	cd kernel && $(CARGO) -Zjson-target-spec build $(FEATURES)
 
-kernel: $(ASM_OBJ) $(DEBUG_LIB) linker.ld
-	$(LD) -n -T linker.ld -o $(DEBUG_BIN) $(ASM_OBJ) $(DEBUG_LIB)
+# Named kernel-bin, not kernel — a target literally named `kernel` would
+# collide with the kernel/ directory (harmless in principle, since
+# .PHONY targets bypass the filesystem check regardless of what's on
+# disk with the same name, but confusing to read).
+kernel-bin: $(ASM_OBJ) $(DEBUG_LIB) kernel/linker.ld
+	$(LD) -n -T kernel/linker.ld -o $(DEBUG_BIN) $(ASM_OBJ) $(DEBUG_LIB)
 
-iso: kernel initrd
+iso: kernel-bin initrd
 	mkdir -p $(ISO_DIR)/boot/grub
 	cp $(DEBUG_BIN) $(ISO_DIR)/boot/kernel.bin
 	cp $(INITRD_IMG) $(ISO_DIR)/boot/initrd.img
-	cp grub.cfg $(ISO_DIR)/boot/grub/grub.cfg
+	cp kernel/grub.cfg $(ISO_DIR)/boot/grub/grub.cfg
 	grub2-mkrescue -o $(DEBUG_ISO) $(ISO_DIR)
 
 # ============================================================================
 # Release Build (optimized + stripped)
 # ============================================================================
 
-$(RELEASE_LIB): $(RUST_SOURCES) Cargo.toml $(TARGET_SPEC).json .cargo/config.toml FORCE
-	$(CARGO) -Zjson-target-spec build --release $(FEATURES)
+$(RELEASE_LIB): $(RUST_SOURCES) kernel/Cargo.toml fs/Cargo.toml kernel/$(TARGET_SPEC).json kernel/.cargo/config.toml FORCE
+	cd kernel && $(CARGO) -Zjson-target-spec build --release $(FEATURES)
 
-kernel-release: $(ASM_OBJ) $(RELEASE_LIB) linker.ld
-	$(LD) -n -T linker.ld -o $(RELEASE_BIN) $(ASM_OBJ) $(RELEASE_LIB)
+kernel-release: $(ASM_OBJ) $(RELEASE_LIB) kernel/linker.ld
+	$(LD) -n -T kernel/linker.ld -o $(RELEASE_BIN) $(ASM_OBJ) $(RELEASE_LIB)
 	# Strip all symbols except those needed for multiboot
 	$(STRIP) --strip-all $(RELEASE_BIN)
 	# Alternative: keep only essential symbols
@@ -155,7 +170,7 @@ iso-release: kernel-release initrd
 	mkdir -p $(ISO_DIR)/boot/grub
 	cp $(RELEASE_BIN) $(ISO_DIR)/boot/kernel.bin
 	cp $(INITRD_IMG) $(ISO_DIR)/boot/initrd.img
-	cp grub.cfg $(ISO_DIR)/boot/grub/grub.cfg
+	cp kernel/grub.cfg $(ISO_DIR)/boot/grub/grub.cfg
 	grub2-mkrescue -o $(RELEASE_ISO) $(ISO_DIR)
 
 # ============================================================================
@@ -257,7 +272,7 @@ gdb: iso disk
 # Utilities
 # ============================================================================
 
-size: kernel kernel-release
+size: kernel-bin kernel-release
 	@echo "=== Kernel Binary Sizes ==="
 	@echo "Debug:"
 	@ls -lh $(DEBUG_BIN) | awk '{print "  " $$5 " " $$9}'

@@ -138,7 +138,7 @@ pub extern "C" fn kernel_main(magic: u64, mb_info_addr: u64) -> ! {
         match fs::init_ramdisk() {
             Ok(()) => pr_info!(
                 "A: formatted + mounted a {} KiB FAT32 ramdisk",
-                fs::ramdisk::TOTAL_SECTORS * fs::BLOCK_SIZE / 1024
+                basicos_fs::ramdisk::TOTAL_SECTORS * fs::BLOCK_SIZE / 1024
             ),
             Err(e) => pr_warn!("A: {}", e),
         }

@@ -2,24 +2,24 @@
 //! ATA disk, the in-memory initrd GRUB loads as a multiboot2 module, or
 //! the writable in-memory [`RamDisk`].
 //!
-//! Exposes three global mount points rather than requiring callers to
-//! thread a `Fat32Fs` handle through the kernel: [`with_disk`],
-//! [`with_initrd`], [`with_ramdisk`]. Mirrors the singleton pattern
-//! `mem::frame`/`mem::heap` already use.
-//!
-//! On top of that, [`Drive`]/[`resolve_path`]/[`with_drive`] give the
-//! three a single DOS-style namespace — `A:` the ramdisk, `B:` the
-//! initrd, `C:` the main disk — so callers (the syscall layer, the
-//! shell) don't each need their own copy of "which drive does this
-//! path mean". See [`resolve_path`] for the exact rules.
+//! The format itself (parsing, directory walks, the ramdisk's own
+//! "mkfs", the [`BlockDevice`] trait) lives in the `basicos-fs` crate
+//! now, not here — see its own doc comment for why. What's left in this
+//! module is purely kernel-specific glue: [`AtaDisk`] (the one
+//! [`BlockDevice`] impl that needs real hardware access), three global
+//! mount points ([`with_disk`]/[`with_initrd`]/[`with_ramdisk`], the
+//! same singleton pattern `mem::frame`/`mem::heap` use) so callers don't
+//! have to thread a `Fat32Fs` handle through the kernel, and on top of
+//! that, [`Drive`]/[`resolve_path`]/[`with_drive`] giving the three a
+//! single DOS-style namespace — `A:` the ramdisk, `B:` the initrd, `C:`
+//! the main disk — so callers (the syscall layer, the shell) don't each
+//! need their own copy of "which drive does this path mean". See
+//! [`resolve_path`] for the exact rules.
 
-pub mod block;
-pub mod fat32;
-pub mod ramdisk;
+mod ata_disk;
 
-pub use block::{AtaDisk, BlockDevice, BlockError, MemDisk, BLOCK_SIZE};
-pub use fat32::{DirEntry, Fat32Error, Fat32Fs};
-pub use ramdisk::RamDisk;
+pub use ata_disk::AtaDisk;
+pub use basicos_fs::{BlockDevice, BlockError, DirEntry, Fat32Error, Fat32Fs, MemDisk, RamDisk, BLOCK_SIZE};
 
 use crate::sync::Spinlock;
 use alloc::boxed::Box;

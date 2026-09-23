@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "basicos"
 version = "0.1.0"
+dependencies = [
+ "basicos-fs",
+]
+
+[[package]]
+name = "basicos-fs"
+version = "0.1.0"

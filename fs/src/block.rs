@@ -1,8 +1,14 @@
 //! Block device abstraction shared by every storage backend, so
 //! `fat32` doesn't need to know whether it's talking to a real ATA disk
 //! or an in-memory initrd image.
-
-use crate::drivers::ata;
+//!
+//! Only the hardware-agnostic pieces live here: the [`BlockDevice`]
+//! trait itself and [`MemDisk`] (a read-only in-memory backend, useful
+//! both for the kernel's initrd and for host-side tools testing against
+//! a disk image file). A concrete backend that touches real hardware —
+//! `AtaDisk`, in the kernel — implements [`BlockDevice`] but lives in
+//! whichever binary actually has that hardware access; this crate has
+//! none.
 
 /// Every block device here speaks in fixed 512-byte blocks — matches
 /// both the ATA sector size and the FAT32 volumes we expect to mount
@@ -31,45 +37,9 @@ pub trait BlockDevice: Send {
     fn write_block(&mut self, index: u64, buf: &[u8]) -> Result<(), BlockError>;
 }
 
-/// The primary ATA bus's master drive, addressed one 512-byte sector
-/// (= one block) at a time.
-pub struct AtaDisk {
-    sector_count: u64,
-}
-
-impl AtaDisk {
-    /// Probe the primary master drive with IDENTIFY. Returns `None` if
-    /// nothing answers.
-    pub fn probe() -> Option<Self> {
-        let info = ata::identify().ok()?;
-        Some(Self {
-            sector_count: info.sector_count as u64,
-        })
-    }
-}
-
-impl BlockDevice for AtaDisk {
-    fn block_count(&self) -> u64 {
-        self.sector_count
-    }
-
-    fn read_block(&mut self, index: u64, buf: &mut [u8]) -> Result<(), BlockError> {
-        if index >= self.sector_count || buf.len() < BLOCK_SIZE {
-            return Err(BlockError::OutOfRange);
-        }
-        ata::read_sectors(index as u32, 1, buf).map_err(|_| BlockError::Io)
-    }
-
-    fn write_block(&mut self, index: u64, buf: &[u8]) -> Result<(), BlockError> {
-        if index >= self.sector_count || buf.len() < BLOCK_SIZE {
-            return Err(BlockError::OutOfRange);
-        }
-        ata::write_sectors(index as u32, 1, buf).map_err(|_| BlockError::Io)
-    }
-}
-
-/// A read-only disk image sitting in memory — backs the initrd, which
-/// GRUB loads as a multiboot2 module before jumping into the kernel.
+/// A read-only disk image sitting in memory — backs the kernel's
+/// initrd (a multiboot2 module GRUB loads before jumping into it), or
+/// any other already-loaded byte slice a caller wants to mount.
 pub struct MemDisk {
     data: &'static [u8],
 }

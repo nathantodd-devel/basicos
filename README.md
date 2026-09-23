@@ -8,7 +8,7 @@ jump.
 
 ## Features
 
-- **Multiboot2 boot** (`entrypoint.s`) — GRUB-compatible header, CPUID/long-mode
+- **Multiboot2 boot** (`kernel/entrypoint.s`) — GRUB-compatible header, CPUID/long-mode
   sanity checks, identity-mapped page tables (1 GiB via 2 MiB huge pages), and
   a manual transition into 64-bit long mode before calling into Rust.
 - **GDT + TSS** (`arch/x86_64/gdt.rs`) — kernel/user code & data segments and a
@@ -25,10 +25,13 @@ jump.
   independently toggleable VGA/serial sinks.
 - **Drivers** (`drivers/`) — VGA text-mode console, 16550 serial port, a
   PS/2 keyboard driver (scancode set 1 → ASCII), and an ATA (PIO) disk driver.
-- **Storage** (`fs/`) — a hand-rolled FAT32 (read/write, no LFN) over any
-  block device: the ATA disk, the read-only initrd, or a writable in-memory
+- **Storage** — a hand-rolled FAT32 (read/write, no LFN) over any block
+  device: the ATA disk, the read-only initrd, or a writable in-memory
   ramdisk formatted from scratch at boot. DOS-style drive letters (`A:` the
-  ramdisk, `B:` the initrd, `C:` the disk) pick between them.
+  ramdisk, `B:` the initrd, `C:` the disk) pick between them. The format
+  itself lives in the `fs/` workspace crate (`basicos-fs`), decoupled from
+  the kernel — see "Project layout" below; `kernel/src/fs/` is just the
+  hardware glue (the ATA `BlockDevice` impl, mount points, drive letters).
 - **Sync primitives** (`sync/`) — a spinlock and a lock-free ring buffer used
   by the logging subsystem.
 - **Usermode stub** (`usermode/`) — a minimal ring-3 entry point used to prove
@@ -79,11 +82,12 @@ make FEATURES="--no-default-features --features heap,keyboard"
 
 With `scheduler` on (the default), the kernel drops into an interactive
 shell after boot instead of running the fixed `usermode-demo` program — the
-two don't compose (see `sched`'s module docs for why a ring-3 program can't
-safely be a scheduler task yet). Disabling both `scheduler` and
-`usermode-demo` is the most visible change from there — the kernel finishes
-its boot sequence and just halts. See `[features]` in `Cargo.toml` for the
-exact dependency graph.
+two don't compose (see `sched`'s module docs for why), and ring-3 programs
+launched from the shell (`run <path>`) are real, preemptible scheduler tasks
+with their own address space, not a one-way jump. Disabling both `scheduler`
+and `usermode-demo` is the most visible change from there — the kernel
+finishes its boot sequence and just halts. See `[features]` in
+`kernel/Cargo.toml` for the exact dependency graph.
 
 ## Requirements
 
@@ -91,10 +95,13 @@ exact dependency graph.
 - `grub2-mkrescue` (or `grub-mkrescue`) + `xorriso`, for building the ISO
 - `qemu-system-x86_64`, for running it
 - Binutils (`as`, `ld`, `strip`) targeting x86_64
+- A host C compiler (`gcc` or `clang`), only if you're building `userland/`
 
-The crate builds against a custom target (`x86_64-basicos.json`) using
-`-Zbuild-std`, so no installed target triple is required — Cargo builds
-`core` and `compiler_builtins` from source (configured in `.cargo/config.toml`).
+The `kernel` crate builds against a custom target
+(`kernel/x86_64-basicos.json`) using `-Zbuild-std`, so no installed target
+triple is required — Cargo builds `core` and `compiler_builtins` from source
+(configured in `kernel/.cargo/config.toml`). The sibling `fs` crate is an
+ordinary host-target crate — see "Project layout" below.
 
 ## Building & running
 
@@ -142,33 +149,63 @@ features, so a floating `nightly` can break it); bump it with
 
 ## Project layout
 
+A Cargo workspace (root [`Cargo.toml`](Cargo.toml) is a virtual manifest —
+`[workspace] members = ["kernel", "fs"]`), plus non-Cargo pieces that build
+through the top-level `Makefile`:
+
 ```
-entrypoint.s         Multiboot2 header, long-mode bring-up, jump into Rust
-linker.ld            Link script (kernel loaded at 1 MiB)
-grub.cfg             GRUB menu entry for the ISO
-x86_64-basicos.json  Custom bare-metal target spec
-testprog.s/.ld       Standalone test ELF binary for exercising elf::load
-src/
-  lib.rs             kernel_main: boot sequence, panic handler
-  log.rs             printk-style logging + ring buffer
-  arch/x86_64/       GDT/TSS, IDT, PIC, SYSCALL/SYSRET, CPUID info, port I/O
-  drivers/           VGA, serial, keyboard, ATA
-  fs/                FAT32 on any BlockDevice (disk, initrd, or the ramdisk);
-                     A:/B:/C: drive-letter resolution (fs::resolve_path)
-  mem/               frame allocator, paging, heap allocator, multiboot2
-  sync/              spinlock, ring buffer
-  syscall/           syscall dispatch table
-  usermode/          ring-3 entry stub (usermode-demo)
-  sched/             process/task abstraction + round-robin scheduler
-  shell/             interactive command shell
-  elf/               ELF64 loader
+kernel/                 The OS itself — a #![no_std] crate, custom target
+  entrypoint.s          Multiboot2 header, long-mode bring-up, jump into Rust
+  linker.ld             Link script (kernel loaded at 1 MiB)
+  grub.cfg              GRUB menu entry for the ISO
+  x86_64-basicos.json   Custom bare-metal target spec
+  .cargo/config.toml    build-std, the target above, force-frame-pointers
+  src/
+    lib.rs              kernel_main: boot sequence, panic handler
+    log.rs               printk-style logging + ring buffer
+    arch/x86_64/         GDT/TSS, IDT, PIC, SYSCALL/SYSRET, CPUID info, port I/O
+    drivers/             VGA, serial, keyboard, ATA
+    fs/                  Kernel-side glue only (see fs/ below): the ATA
+                         BlockDevice impl, mount points, A:/B:/C: drive
+                         letters (fs::resolve_path)
+    mem/                 frame allocator, paging (+ per-process address
+                         spaces), heap allocator, multiboot2
+    sync/                spinlock, ring buffer
+    syscall/             syscall dispatch table (read/write/fork/execve/
+                         wait4/mmap/munmap/brk/...)
+    usermode/            ring-3 entry stub (usermode-demo)
+    sched/               process/task abstraction, round-robin scheduler,
+                         fork/exec/wait support
+    shell/               interactive command shell
+    elf/                 ELF64 loader
+
+fs/                     `basicos-fs` — the FAT32 format, decoupled from the
+                        kernel (see fs/src/lib.rs) so it's usable both in
+                        the kernel and, eventually, from a host-side
+                        mkfs/fsck-equivalent tool outside it. An ordinary
+                        host-target crate — no custom target, no build-std.
+  src/
+    fat32.rs             Parsing, directory walks, read/write
+    ramdisk.rs           From-scratch FAT32 "mkfs" over a BlockDevice
+    block.rs             The BlockDevice trait + MemDisk
+
+userland/               Freestanding C programs against the kernel's own
+                        syscall ABI (syscalls.h) — not a Cargo crate; see
+                        userland/Makefile. Copied onto the test disk's
+                        C:\TESTPROG\ by `make disk`.
+
+testprog.s/.ld,
+forktest.s/.ld          Standalone test ELF binaries, hand-written in
+                        assembly, for exercising elf::load without a C
+                        toolchain — copied onto the test disk as
+                        /hello.elf and /forktest.elf.
 ```
 
 ## Status / roadmap
 
 This is a work in progress. See [`todo.md`](todo.md) for the running list —
-a real filesystem-backed shell now exists, and CI, networking, and turning
-loaded ELF binaries into real (returning) scheduler tasks are still open.
+a real filesystem-backed shell, per-process address spaces, and fork/exec/
+wait/mmap/brk all exist now; CI and networking are still open.
 
 ## License
 
