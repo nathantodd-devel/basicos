@@ -12,6 +12,9 @@
 #   make initrd-reset - wipe and recreate build/initrd.img from scratch
 #   make reset-disks  - disk-reset + initrd-reset
 #   make userland     - build userland/*.c (see userland/Makefile)
+#   make init-elf     - build init/ (Rust userspace) to build/init.elf
+#   make rust-programs - build programs/* (Rust, via sdk/) to build/bin/*.elf
+#   make new-prog NAME=foo - scaffold a new Rust program in programs/foo
 #   make clean        - remove build artifacts
 #   make size         - show kernel binary sizes
 #
@@ -101,12 +104,27 @@ FORKTEST_ELF := $(BUILD_DIR)/forktest.elf
 # (see its header comment) and the two shouldn't be mixed up.
 USERLAND_DIR := userland
 
+# Rust userspace (the SDK in sdk/, init/, and every crate under
+# programs/). The toolchain config — target, build-std, static
+# relocation, the linker script — is sdk/config.toml, passed to cargo
+# with --config; cargo is run from the repo root, since the paths inside
+# that file (the target spec, link.ld) are relative to it. Programs are
+# discovered by directory: drop a crate in programs/ (or `make new-prog
+# NAME=foo`) and it's built and copied onto the disk as C:/BIN/FOO.ELF.
+# init is special-cased: it goes at the disk root as /init.elf, the path
+# the kernel boots. Names must fit FAT32's 8.3 (8 chars, no long names).
+RUST_USER     := $(CARGO) --config sdk/config.toml -Zjson-target-spec
+RUST_PROGRAMS := $(notdir $(wildcard programs/*))
+RUST_OUT      := target/$(TARGET_SPEC)/debug
+INIT_ELF      := $(BUILD_DIR)/init.elf
+RUST_ELFS     := $(addprefix $(BUILD_DIR)/bin/,$(addsuffix .elf,$(RUST_PROGRAMS)))
+
 # -boot d: always boot the CD, regardless of the attached hard drive —
 # without it QEMU can try the hard drive first once one is attached.
 QEMU_FLAGS  := -m 256M -serial stdio -boot d -drive file=$(DISK_IMG),format=raw,if=ide,index=0
 
 .PHONY: all debug release kernel-bin kernel-release iso iso-release run run-release gdb \
-        disk disk-reset initrd initrd-reset reset-disks testprog forktest userland \
+        disk disk-reset initrd initrd-reset reset-disks testprog forktest userland init-elf rust-programs new-prog \
         clean size FORCE
 
 all: iso
@@ -129,7 +147,7 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 $(ASM_OBJ): kernel/entrypoint.s | $(BUILD_DIR)
-	$(AS) --64 $< -o $@
+	$(AS) -g --64 $< -o $@
 
 # ============================================================================
 # Debug Build
@@ -183,7 +201,7 @@ iso-release: kernel-release initrd
 # wipes and repopulates both from scratch — use it if a test run has
 # left the disk in a state you don't want to keep debugging against.
 
-$(DISK_IMG): $(TESTPROG_ELF) $(FORKTEST_ELF) userland
+$(DISK_IMG): $(TESTPROG_ELF) $(FORKTEST_ELF) $(INIT_ELF) $(RUST_ELFS) userland
 	mkdir -p $(BUILD_DIR)
 	$(QEMU_IMG) create -f raw $(DISK_IMG) $(DISK_SIZE)
 	$(MKFS_VFAT) -F 32 -n BASICOS $(DISK_IMG)
@@ -192,6 +210,9 @@ $(DISK_IMG): $(TESTPROG_ELF) $(FORKTEST_ELF) userland
 	echo "just some docs on the test disk" | $(MCOPY) -i $(DISK_IMG) - ::/docs/readme.txt
 	$(MCOPY) -i $(DISK_IMG) $(TESTPROG_ELF) ::/hello.elf
 	$(MCOPY) -i $(DISK_IMG) $(FORKTEST_ELF) ::/forktest.elf
+	$(MCOPY) -i $(DISK_IMG) $(INIT_ELF) ::/init.elf
+	mmd -i $(DISK_IMG) ::/BIN
+	$(MCOPY) -i $(DISK_IMG) $(RUST_ELFS) ::/BIN/
 	mmd -i $(DISK_IMG) ::/TESTPROG
 	$(MCOPY) -i $(DISK_IMG) $(USERLAND_DIR)/build/*.elf ::/TESTPROG/
 
@@ -219,6 +240,37 @@ $(FORKTEST_ELF): $(FORKTEST_OBJ) forktest.ld
 	$(LD) -n -T forktest.ld -o $(FORKTEST_ELF) $(FORKTEST_OBJ)
 
 forktest: $(FORKTEST_ELF)
+
+# One cargo invocation builds init and every program. FORCE-style (a
+# phony target) for the same reason as the kernel's cargo rule — cargo's
+# own fingerprinting decides what's stale, not make.
+.PHONY: rust-user
+rust-user:
+	$(RUST_USER) build -p init $(addprefix -p ,$(RUST_PROGRAMS))
+
+# The copies that go on the disk are stripped of debug info: the kernel
+# reads the entire file into a heap buffer on every exec (over PIO), and
+# ~97% of an unstripped binary is DWARF nothing loads. The unstripped
+# originals stay under target/ for GDB (`add-symbol-file`).
+$(INIT_ELF): rust-user | $(BUILD_DIR)
+	$(STRIP) --strip-debug -o $@ $(RUST_OUT)/init
+
+$(BUILD_DIR)/bin/%.elf: rust-user
+	mkdir -p $(BUILD_DIR)/bin
+	$(STRIP) --strip-debug -o $@ $(RUST_OUT)/$*
+
+init-elf: $(INIT_ELF)
+rust-programs: $(RUST_ELFS)
+
+# Scaffold a new Rust program: `make new-prog NAME=foo`.
+new-prog:
+	@test -n "$(NAME)" || { echo "usage: make new-prog NAME=<8.3-safe name>"; exit 1; }
+	@test $$(printf %s "$(NAME)" | wc -c) -le 8 || { echo "NAME must be <= 8 chars (FAT32 8.3 has no long names)"; exit 1; }
+	@test ! -e programs/$(NAME) || { echo "programs/$(NAME) already exists"; exit 1; }
+	mkdir -p programs/$(NAME)/src
+	printf '[package]\nname = "$(NAME)"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\nbasicos-sdk = { path = "../../sdk" }\n' > programs/$(NAME)/Cargo.toml
+	printf '#![no_std]\n#![no_main]\n\nuse basicos_sdk::prelude::*;\n\nbasicos_sdk::entry!(main);\n\nfn main(_args: Args) {\n    println!("$(NAME): hello!");\n}\n' > programs/$(NAME)/src/main.rs
+	@echo "created programs/$(NAME) — build with 'make disk', run it with 'run C:/BIN/$(shell echo $(NAME) | tr a-z A-Z).ELF'"
 
 # userland/: C programs against syscalls.h — see userland/Makefile for
 # the actual build rules (compiler flags, crt0, linker script) and the

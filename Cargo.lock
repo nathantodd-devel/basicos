@@ -12,3 +12,42 @@ dependencies = [
 [[package]]
 name = "basicos-fs"
 version = "0.1.0"
+
+[[package]]
+name = "basicos-sdk"
+version = "0.1.0"
+
+[[package]]
+name = "forkwait"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]
+
+[[package]]
+name = "heap"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]
+
+[[package]]
+name = "hello"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]
+
+[[package]]
+name = "init"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]
+
+[[package]]
+name = "ls"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]

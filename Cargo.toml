@@ -12,6 +12,15 @@
 #             doc comment) — an ordinary host-target crate, no special
 #             target/build-std needed. `kernel` depends on it; a future
 #             host-side tool (mkfs/fsck-equivalent) would too.
+#   sdk/      `basicos-sdk`, the Rust userspace SDK: syscall wrappers, a
+#             global allocator, the `entry!` startup macro, `println!`.
+#             Also holds the userspace toolchain config — config.toml
+#             (target, build-std, static relocation, linker args) and
+#             link.ld — which the Makefile hands to cargo via --config.
+#   init/     the first userspace program, built on the SDK.
+#   programs/ every other Rust userspace program, one crate each
+#             (`make new-prog NAME=foo` scaffolds one); the "programs/*"
+#             glob below picks them up automatically.
 #
 # `userland/` (C programs against the kernel's syscall ABI) and the
 # standalone assembly test binaries at the repo root (testprog.s,
@@ -19,7 +28,15 @@
 # see userland/Makefile and the top-level Makefile for how those build.
 [workspace]
 resolver = "2"
-members = ["kernel", "fs"]
+members = ["kernel", "fs", "init", "sdk", "programs/*"]
+# A bare `cargo build`/`cargo test` at the root only touches `fs`, the one
+# member that's an ordinary host-target crate. `kernel` and `init` both
+# need their own target + build-std (kernel/.cargo/config.toml, which
+# only applies with kernel/ as cwd; sdk/config.toml, passed via --config
+# for the userspace crates), so building them from here would try — and
+# fail — to build them for the host. The Makefile's `kernel-bin` and
+# `rust-user` rules are how they get built.
+default-members = ["fs"]
 
 # Cargo only honors [profile.*] in the workspace root, not in member
 # manifests — these apply to every member, though only `kernel` (the

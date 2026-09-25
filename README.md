@@ -97,6 +97,18 @@ finishes its boot sequence and just halts. See `[features]` in
 - Binutils (`as`, `ld`, `strip`) targeting x86_64
 - A host C compiler (`gcc` or `clang`), only if you're building `userland/`
 
+### Writing a Rust program for basicos
+
+```sh
+make new-prog NAME=foo      # scaffolds programs/foo (8.3-safe names only)
+$EDITOR programs/foo/src/main.rs
+make disk && make run       # then in the shell: run C:/BIN/FOO.ELF
+```
+
+A program is `#![no_std]`/`#![no_main]`, calls `basicos_sdk::entry!(main)`,
+and `use basicos_sdk::prelude::*;` — see `programs/` for examples, and
+`sdk/src/lib.rs` for what's available.
+
 The `kernel` crate builds against a custom target
 (`kernel/x86_64-basicos.json`) using `-Zbuild-std`, so no installed target
 triple is required — Cargo builds `core` and `compiler_builtins` from source
@@ -150,7 +162,7 @@ features, so a floating `nightly` can break it); bump it with
 ## Project layout
 
 A Cargo workspace (root [`Cargo.toml`](Cargo.toml) is a virtual manifest —
-`[workspace] members = ["kernel", "fs"]`), plus non-Cargo pieces that build
+`[workspace] members = ["kernel", "fs", "init"]`), plus non-Cargo pieces that build
 through the top-level `Makefile`:
 
 ```
@@ -188,6 +200,23 @@ fs/                     `basicos-fs` — the FAT32 format, decoupled from the
     fat32.rs             Parsing, directory walks, read/write
     ramdisk.rs           From-scratch FAT32 "mkfs" over a BlockDevice
     block.rs             The BlockDevice trait + MemDisk
+
+sdk/                    `basicos-sdk` — the Rust userspace SDK (there is no
+                        `std` for basicos; this is core + alloc + the
+                        kernel's syscalls): typed syscall wrappers (fs,
+                        process, mem, io), a global allocator so Vec/
+                        String/Box work, the entry! macro (emits the
+                        _start shim), a panic handler, println!. Also the
+                        userspace toolchain itself: config.toml (target,
+                        build-std, static relocation) and link.ld (load
+                        address), passed to cargo with --config.
+init/                   The first userspace program, built on the SDK.
+                        `make init-elf`; on the disk as C:\INIT.ELF.
+programs/               Every other Rust userspace program, one crate each
+                        (hello, ls, heap, forkwait). `make new-prog
+                        NAME=foo` scaffolds one; everything here is built
+                        and copied onto the disk as C:\BIN\<NAME>.ELF by
+                        `make disk`, no Makefile edit needed.
 
 userland/               Freestanding C programs against the kernel's own
                         syscall ABI (syscalls.h) — not a Cargo crate; see

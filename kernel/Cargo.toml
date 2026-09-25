@@ -111,7 +111,7 @@ shell = ["scheduler"]
 # (see `sched`'s module docs) — needs `usermode-demo` for the ring-3/
 # syscall machinery, `storage` to read a binary off disk, and `paging`
 # for the per-process address spaces themselves.
-elf-loader = ["usermode-demo", "storage", "paging"]
+elf-loader = ["usermode-demo", "storage", "paging", "scheduler"]
 
 
 bad-interrupt-panic = []

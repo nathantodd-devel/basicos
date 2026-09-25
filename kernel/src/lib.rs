@@ -176,31 +176,20 @@ pub extern "C" fn kernel_main(magic: u64, mb_info_addr: u64) -> ! {
     let brand = cpu_info::get_cpu_brand();
     pr_info!("CPU: {} - {}", vendor.as_str(), brand.as_str());
 
-    // `scheduler` takes over the boot tail when it's on: it and the
-    // direct ring-3 jump below don't compose (see `sched`'s module
-    // docs for why), and a scheduler with an interactive shell is
-    // strictly more useful than a demo that runs once and halts.
-    #[cfg(feature = "scheduler")]
-    {
-        sched::spawn("task-a", sched::demo_task_a);
-        sched::spawn("task-b", sched::demo_task_b);
-        // Not usermode::user_mode_stub here — it's a ring-3 program (its
-        // first `syscall`'s `sysretq` forces CPL 3 unconditionally), and
-        // a scheduler task is ring 0 by construction; see the comment at
-        // the end of `usermode::user_mode_stub` for exactly how that
-        // combination breaks the moment it touches anything privileged.
-        #[cfg(feature = "shell")]
-        sched::spawn("shell", shell::shell_task);
-        pr_info!("Scheduler: starting round-robin");
-        sched::run();
-    }
-
     #[cfg(all(not(feature = "scheduler"), feature = "usermode-demo"))]
     {
         pr_notice!("Jumping to ring 3...");
         let stack_top =
             unsafe { core::ptr::addr_of!(USER_STACK.0) as u64 + USER_STACK_SIZE as u64 };
         unsafe { gdt::jump_to_ring3(usermode::user_mode_stub, stack_top) }
+    }
+
+    // find a C:/init.elf and run it
+
+    #[cfg(feature = "elf-loader")]
+    {
+        let _pid = elf::spawn("init", "C:/INIT.ELF").expect("INIT.ELF required for boot");
+        sched::run();
     }
 
     #[cfg(all(not(feature = "scheduler"), not(feature = "usermode-demo")))]
