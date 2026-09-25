@@ -172,18 +172,24 @@ fn task_stack_top(idx: usize) -> u64 {
 /// Minimal context switch — see the module docs for exactly what this
 /// does and why it's safe to call from an interrupt handler.
 ///
-/// Also unconditionally `sti`s once on the new stack, after the switch
-/// but before the final `ret`. Without this, a task preempted by the
-/// timer resumes the scheduler (and whatever runs next) with IF still
-/// cleared — the interrupt gate clears it on entry, and since we leave
-/// that handler invocation suspended mid-call rather than letting it
-/// `iretq`, nothing else would ever set IF back to 1. RFLAGS is a
-/// single CPU-wide register, not something `switch()`'s per-task GPR
-/// save/restore touches on its own, so this has to be forced explicitly
-/// on every switch rather than captured as part of a task's context.
-/// `sti`'s documented one-instruction shadow means the `pop`s below
-/// still execute before any interrupt can land — this can't get
-/// preempted mid-restore.
+/// RFLAGS is saved and restored along with the callee-saved registers,
+/// so **every context resumes with the interrupt-enable state it had
+/// when it switched out** — a task that yielded from a syscall (IF=1)
+/// comes back with IF=1, one suspended inside a timer handler (IF=0,
+/// since interrupt gates clear it) comes back with IF=0 and re-enables
+/// on its own `iretq`, and the scheduler loop (which runs with IF=0, see
+/// [`run`]) comes back with IF=0.
+///
+/// This replaced an unconditional `sti` on every switch, which was
+/// wrong in a way that's easy to miss: it turned interrupts on while the
+/// CPU was still in scheduler context (or mid-way through a switch to
+/// it), where [`CURRENT`] doesn't describe what's actually running. A
+/// timer tick landing there made `yield_now` save the *scheduler's* RSP
+/// into a task's slot, and the next switch into that task popped garbage
+/// off the boot stack. It only showed up once a single task sat in a
+/// tight `yield` loop (init, as the only task), because that's when the
+/// scheduler is switching constantly and ticks reliably land in the
+/// window.
 #[unsafe(naked)]
 unsafe extern "C" fn switch(old_rsp: *mut u64, new_rsp: u64) {
     core::arch::naked_asm!(
@@ -193,9 +199,10 @@ unsafe extern "C" fn switch(old_rsp: *mut u64, new_rsp: u64) {
         "push r13",
         "push r14",
         "push r15",
+        "pushfq",
         "mov [rdi], rsp",
         "mov rsp, rsi",
-        "sti",
+        "popfq",
         "pop r15",
         "pop r14",
         "pop r13",
@@ -206,8 +213,14 @@ unsafe extern "C" fn switch(old_rsp: *mut u64, new_rsp: u64) {
     );
 }
 
+/// RFLAGS a brand-new task starts with: IF set (a kernel thread has to
+/// be preemptible from its first instruction; a process gets IF from its
+/// `iretq` frame anyway), plus the always-1 reserved bit 1.
+const INITIAL_RFLAGS: u64 = 0x202;
+
 /// Plant a fake `switch()` frame on task `idx`'s stack so the *first*
-/// switch into it pops six zeroed callee-saved registers and then
+/// switch into it loads `INITIAL_RFLAGS`, pops six zeroed callee-saved
+/// registers, and then
 /// `ret`s straight into `entry`, as if `entry` had just been `call`ed.
 /// Shared by every "brand new task" path (`spawn`, `spawn_process`, and
 /// fork's child) — they differ only in what `entry` is and what (if
@@ -240,6 +253,8 @@ unsafe fn plant_initial_frame(idx: usize, entry: u64, extra: &[u64]) -> u64 {
         sp = sp.sub(1);
         *sp = 0; // rbp, rbx, r12, r13, r14, r15 (in that pop order)
     }
+    sp = sp.sub(1);
+    *sp = INITIAL_RFLAGS; // popped first by switch()'s `popfq`
     sp as u64
 }
 
@@ -277,7 +292,15 @@ fn pick_next() -> Option<usize> {
 
 /// The scheduler loop. Call once, after spawning whatever tasks should
 /// start ready; never returns.
+///
+/// Runs with interrupts **disabled** for everything except the idle
+/// `sti; hlt`: `CURRENT` and the task table are only meaningful to a
+/// timer tick's `yield_now` while a task really is on the CPU, and the
+/// stretch between "CURRENT = idx" and the switch (and back) is exactly
+/// where that stops being true. Each task's own interrupt state comes
+/// and goes with it via [`switch`]'s RFLAGS save/restore.
 pub fn run() -> ! {
+    interrupts::disable();
     loop {
         match pick_next() {
             Some(idx) => unsafe {
@@ -300,9 +323,15 @@ pub fn run() -> ! {
             },
             None => {
                 // Nothing ready. Halt until the next interrupt (the
-                // timer, if nothing else) and look again.
-                interrupts::enable();
-                unsafe { core::arch::asm!("hlt") };
+                // timer, if nothing else) and look again. `sti` and
+                // `hlt` in one asm block on purpose: `sti`'s
+                // one-instruction shadow means an interrupt can't slip
+                // in between them and be lost to a `hlt` that then
+                // sleeps through it. CURRENT is NONE_RUNNING here, so a
+                // tick's `yield_now` returns immediately; we turn
+                // interrupts back off before touching anything.
+                unsafe { core::arch::asm!("sti", "hlt") };
+                interrupts::disable();
             }
         }
     }
