@@ -1,7 +1,7 @@
 #!/bin/sh
 # Boot basicos in QEMU from this release folder.
 #
-#   ./run.sh              # serial console on this terminal, plus a QEMU window
+#   ./run.sh              # the console is the QEMU window; this terminal mirrors it
 #   ./run.sh -nographic   # headless: everything over this terminal
 #
 # Extra arguments are passed straight through to qemu-system-x86_64.
@@ -25,7 +25,7 @@ if [ ! -f disk.img ]; then
 fi
 
 # -boot d: boot the CD, not the (unbootable, data-only) hard disk.
-# -serial stdio: the kernel log and the shell's I/O go over the serial port.
+# -serial stdio: the full kernel log, and a mirror of the console.
 # -netdev user + rtl8139: NAT'd networking (guest 10.0.2.15, gateway
 # 10.0.2.2), the NIC the kernel has a driver for.
 exec qemu-system-x86_64 \

@@ -6,19 +6,20 @@
 //! keyboard didn't have — arrow keys, right Ctrl/Alt, Insert/Delete/
 //! Home/End/PageUp/PageDown, and the keypad's Enter and `/`.
 //!
-//! Decoded output goes to two places:
-//! - straight to the VGA console, for printable characters/backspace/
-//!   enter/tab — local echo, so typing is visible immediately;
-//! - into a small ring buffer other kernel code can read from with
-//!   `read_byte`/`try_read_byte`/`read_line`, the same shape as
-//!   `drivers::serial`'s input API.
+//! Decoded keys go into a small ring buffer other kernel code can read
+//! from with `read_byte`/`try_read_byte`/`read_line`, the same shape as
+//! `drivers::serial`'s input API. Normally that reader is the console
+//! (`syscall::console`), whose line discipline does the echoing. Only a
+//! kernel with no such layer (no `usermode-demo`) echoes from here, for
+//! `read_line`'s benefit.
 //!
-//! Non-printable keys (arrows, function keys, Home/End/...) only go
-//! into the ring buffer, as the same ANSI/VT220 escape sequences a real
-//! terminal would send (`ESC [ A` for Up, `ESC O P` for F1, ...) — there's
-//! no separate "key event" type here, just one byte stream, like a tty.
-//! They're *not* echoed to VGA: our text-mode console has no escape
-//! interpreter, so printing them raw would just look like garbage.
+//! Non-printable keys (arrows, function keys, Home/End/...) go in as the
+//! same ANSI/VT220 escape sequences a real terminal would send (`ESC [ A`
+//! for Up, `ESC O P` for F1, ...) — there's no separate "key event" type
+//! here, just one byte stream, like a tty.
+//!
+//! The exception is Shift+PageUp/PageDown, which never reach the stream:
+//! they scroll the VGA console itself.
 
 use super::vga;
 use crate::sync::RingBuffer;
@@ -100,6 +101,14 @@ const BUFFER_SIZE: usize = 128;
 static RX_BUFFER: RingBuffer<u8, BUFFER_SIZE> = RingBuffer::new();
 static DATA_AVAILABLE: AtomicBool = AtomicBool::new(false);
 
+/// Whether this driver echoes typing itself (see the module docs).
+const LOCAL_ECHO: bool = cfg!(not(feature = "usermode-demo"));
+
+/// Lines Shift+PageUp/PageDown move the console by.
+const SCROLL_PAGE: isize = 12;
+const PAGE_UP: u8 = 0x49;
+const PAGE_DOWN: u8 = 0x51;
+
 /// Queue `bytes` for readers, optionally echoing them to VGA too.
 /// Silently drops bytes if the queue is full — a slow/absent reader
 /// shouldn't be able to wedge the keyboard IRQ.
@@ -111,7 +120,7 @@ fn emit(bytes: &[u8], echo_to_vga: bool) {
         let _ = RX_BUFFER.try_push(b);
     }
     DATA_AVAILABLE.store(true, Ordering::Release);
-    if echo_to_vga {
+    if echo_to_vga && LOCAL_ECHO {
         for &b in bytes {
             vga::print_char(b);
         }
@@ -150,7 +159,9 @@ fn handle_normal(code: u8) {
     }
 
     if code == BACKSPACE {
-        vga::backspace(); // erase on screen ourselves...
+        if LOCAL_ECHO {
+            vga::backspace(); // erase on screen ourselves...
+        }
         emit(&[0x08], false); // ...and queue it without re-printing
         return;
     }
@@ -200,6 +211,14 @@ fn handle_extended(code: u8) {
     if code == KEYPAD_ENTER {
         emit(b"\n", true);
         return;
+    }
+
+    if modifiers().shift() {
+        match code {
+            PAGE_UP => return vga::scroll_view(SCROLL_PAGE),
+            PAGE_DOWN => return vga::scroll_view(-SCROLL_PAGE),
+            _ => {}
+        }
     }
 
     if let Some(seq) = extended_key_escape(code) {

@@ -1,13 +1,16 @@
 //! The console as a file: fds 0/1/2 of every process start out here.
 //!
-//! Output goes to VGA and the serial port, as `write(1, ..)` always has.
-//! Input is a small cooked-mode line discipline over whichever input
-//! driver is compiled in (serial if `serial-input`, else the keyboard):
-//! bytes are collected into a line with echo and backspace, and `read`
-//! only returns once a whole line (ending in `\n`) is in — the same
-//! contract a terminal in canonical mode gives, which is what programs
-//! written against `read(0, ..)` expect. Ctrl-D on an empty line is
-//! end-of-file; Ctrl-C discards the line being typed.
+//! The console is the VGA screen and PS/2 keyboard, mirrored on the serial
+//! port: output and echo go to both, and input is taken from both, so
+//! `-nographic` and the headless tests drive exactly what's on the screen.
+//!
+//! Input is a small cooked-mode line discipline: bytes are collected into
+//! a line with echo and backspace, and `read` only returns once a whole
+//! line (ending in `\n`) is in — the same contract a terminal in canonical
+//! mode gives, which is what programs written against `read(0, ..)`
+//! expect. Ctrl-D on an empty line is end-of-file; Ctrl-C discards the
+//! line being typed. There's no line editing: the escape sequences that
+//! arrows and function keys send are discarded.
 //!
 //! **A completed line is handed to exactly one reader, whole.** This is
 //! the one console on the machine, and more than one task can be
@@ -48,12 +51,27 @@ struct Line {
     ready: VecDeque<Vec<u8>>,
     /// Ctrl-D on an empty line: the next `read` returns 0 once.
     eof: bool,
+    /// How far through an escape sequence the input is.
+    esc: Escape,
+}
+
+/// An escape sequence on its way through `feed`.
+#[derive(Clone, Copy, PartialEq)]
+enum Escape {
+    None,
+    /// Saw ESC.
+    Start,
+    /// In `ESC [ ...`, up to a final byte.
+    Csi,
+    /// In `ESC O x`, one byte to go.
+    Ss3,
 }
 
 static LINE: Spinlock<Line> = Spinlock::new(Line {
     editing: Vec::new(),
     ready: VecDeque::new(),
     eof: false,
+    esc: Escape::None,
 });
 
 /// Whether any input driver is compiled in at all.
@@ -61,27 +79,50 @@ pub const HAS_INPUT: bool = cfg!(any(feature = "serial-input", feature = "keyboa
 
 fn next_input_byte() -> Option<u8> {
     #[cfg(feature = "serial-input")]
-    return crate::drivers::serial::try_read_byte();
-    #[cfg(all(not(feature = "serial-input"), feature = "keyboard"))]
-    return crate::drivers::keyboard::try_read_byte();
-    #[cfg(not(any(feature = "serial-input", feature = "keyboard")))]
-    return None;
+    if let Some(b) = crate::drivers::serial::try_read_byte() {
+        return Some(b);
+    }
+    #[cfg(feature = "keyboard")]
+    if let Some(b) = crate::drivers::keyboard::try_read_byte() {
+        return Some(b);
+    }
+    None
 }
 
-/// Echo to the terminal — only needed for serial, which is a dumb pipe;
-/// the keyboard driver already echoes each key as it's typed.
+/// Show typing on both halves of the console. (Serial is a dumb pipe and
+/// the keyboard leaves echo to us, so neither does it for itself.)
 fn echo(bytes: &[u8]) {
-    #[cfg(feature = "serial-input")]
     for &b in bytes {
+        crate::drivers::vga::print_char(b);
         crate::drivers::serial::write_byte(b);
     }
-    #[cfg(not(feature = "serial-input"))]
-    let _ = bytes;
 }
 
 /// Feed one raw input byte through the line discipline.
 fn feed(line: &mut Line, byte: u8) {
+    match line.esc {
+        Escape::None => {}
+        Escape::Start => {
+            line.esc = match byte {
+                b'[' => Escape::Csi,
+                b'O' => Escape::Ss3,
+                _ => Escape::None,
+            };
+            return;
+        }
+        Escape::Csi => {
+            if (0x40..=0x7E).contains(&byte) {
+                line.esc = Escape::None;
+            }
+            return;
+        }
+        Escape::Ss3 => {
+            line.esc = Escape::None;
+            return;
+        }
+    }
     match byte {
+        0x1B => line.esc = Escape::Start,
         b'\r' | b'\n' => {
             echo(b"\r\n");
             let mut completed: Vec<u8> = line.editing.drain(..).collect();

@@ -31,6 +31,8 @@ mod syscall;
 #[cfg(feature = "usermode-demo")]
 mod usermode;
 
+use core::ptr::addr_of;
+
 // Re-export commonly used items
 pub use log::{LogLevel, RateLimiter};
 #[cfg(feature = "usermode-demo")]
@@ -42,6 +44,16 @@ use arch::x86_64::syscall as arch_syscall;
 use arch::{cpu_info, gdt, interrupts};
 use drivers::{serial, vga};
 
+extern "C" {
+    static __kernel_start: u8;
+    static __kernel_end: u8;
+}
+
+fn kernel_size() -> usize {
+    let start = addr_of!(__kernel_start) as usize;
+    let end = addr_of!(__kernel_end) as usize;
+    end - start
+}
 /// Entry point called from assembly.
 ///
 /// # Arguments
@@ -56,6 +68,13 @@ pub extern "C" fn kernel_main(magic: u64, mb_info_addr: u64) -> ! {
 
     pr_info!("basicos booted!");
     pr_info!("Multiboot2 + long mode transition succeeded");
+
+    pr_info!(
+        "Start: {:?}, End: {:?}, size: {:?}",
+        addr_of!(__kernel_start),
+        addr_of!(__kernel_end),
+        kernel_size()
+    );
 
     // Verify multiboot2 magic
     if magic as u32 != mem::multiboot2::MULTIBOOT2_BOOTLOADER_MAGIC {
@@ -172,12 +191,22 @@ pub extern "C" fn kernel_main(magic: u64, mb_info_addr: u64) -> ! {
                         "{}: mounted {} {}{} ({} MiB, {}, {}){}",
                         m.drive.letter(),
                         m.fs_type,
-                        if m.label.is_empty() { "volume" } else { "volume " },
+                        if m.label.is_empty() {
+                            "volume"
+                        } else {
+                            "volume "
+                        },
                         m.label,
                         m.bytes >> 20,
                         m.source,
-                        if m.read_only { "read-only" } else { "read-write" },
-                        m.note.map(|n| alloc::format!(" — {}", n)).unwrap_or_default()
+                        if m.read_only {
+                            "read-only"
+                        } else {
+                            "read-write"
+                        },
+                        m.note
+                            .map(|n| alloc::format!(" — {}", n))
+                            .unwrap_or_default()
                     )
                 }
                 Err(why) => pr_warn!("disk: {}", why),
@@ -219,6 +248,9 @@ pub extern "C" fn kernel_main(magic: u64, mb_info_addr: u64) -> ! {
         #[cfg(feature = "elf-loader")]
         {
             let _pid = elf::spawn("init", "C:/INIT.ELF").expect("INIT.ELF required for boot");
+            // Boot is over and the screen is the shell's now. Routine
+            // messages keep going to serial and the log buffer.
+            log::set_vga_log_level(log::LogLevel::Warning);
         }
 
         // The ring-0 debug monitor (off by default — see `shell`).

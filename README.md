@@ -47,6 +47,10 @@ jump.
   logout, and reaps orphans. Commands (`ls`, `cat`, `ps`, `ping`, ...) are
   ordinary programs in `C:/BIN/`; kernel state reaches them through `/proc`.
   `shell/` is an optional ring-0 debug monitor, off by default.
+- **Console** — once booted, the machine is used from the VGA screen and PS/2
+  keyboard, with 500 lines of scrollback on Shift+PageUp/PageDown. The serial
+  port mirrors it, takes input too (so `-nographic` works), and alone carries
+  routine kernel messages after boot.
 - **Process isolation** — ring 3 can reach only its own pages, not kernel
   memory or page 0, and a fault in a process kills that process, not the
   kernel. If init itself dies, the kernel panics.
@@ -276,7 +280,7 @@ programs/               Every other Rust userspace program, one crate each
                         `make disk`, no Makefile edit needed.
 
 tools/                  Test drivers: `feature-check.sh` (feature matrix),
-                        `shell-test.py`, `posix-test.py`, `ext4-test.py`, `net-test.py` (headless QEMU runs;
+                        `shell-test.py`, `vga-test.py`, `posix-test.py`, `ext4-test.py`, `net-test.py` (headless QEMU runs;
                         `qemu-shell.py` is their shared helper).
 
 userland/               Freestanding C programs against the kernel's own

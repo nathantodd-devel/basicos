@@ -42,6 +42,7 @@
 - [x] Per-process file descriptor tables — see Syscalls
 - [x] A fault in ring 3 kills only that process (`interrupts::kill_if_user`), with status 128 + the signal the shell reports. Faults in ring 0 still halt. Verified by `userland/segv.c` and `programs/isotest` via `make shell-test`
 - [x] User/kernel memory isolation — `paging::protect_kernel_mappings` clears the user bit on everything outside the process zone, so ring 3 can only reach its own pages; page 0 is unmapped entirely. Mutation-checked with `make shell-test`
+- [x] Kernel heap: it never merged freed blocks, so traffic shredded it until a small allocation failed (a release-build panic after ~65k UDP datagrams), and it took nearly all of RAM on some builds, leaving `exec` short of frames. Now an address-ordered list with coalescing, capped at half of free memory. Verified by 154k datagrams through `make net-test` on the release kernel
 - [ ] A process that hits the frame limit can panic the kernel: `fork_from`, `new_process_space` and `setup_stack` `.expect()` their allocations instead of returning `ENOMEM`. Reachable with a fork bomb of large processes
 - [ ] User pages are all RWX: no NXE, and ELF segments share pages (`sdk/link.ld` doesn't page-align them), so text isn't read-only and stacks are executable. SMEP/SMAP aren't enabled either
 - [ ] No guard pages on the 16 KiB kernel stacks: an overflow silently corrupts the neighbouring task's stack
@@ -69,8 +70,10 @@ Both were silent, not crashes — the kind that only show up once something exer
 
 ## VGA / Display
 
+- [x] The VGA screen and PS/2 keyboard are the main console: the line discipline takes input from the keyboard as well as serial and echoes to both, control characters and UTF-8 are handled, lines wrap correctly, and after boot only warnings and worse reach the screen. Shift+PageUp/PageDown scroll 500 lines of history. Tested by `make vga-test`, which presses real keys through QEMU's monitor and reads VGA memory
 - [ ] Add color support to VGA driver (currently hardcoded light grey on black)
-- [ ] Implement cursor blinking
+- [ ] Line editing and command history: arrow keys are discarded for now
+- [ ] ANSI escape sequences on output: programs can't position the cursor or set colors on the screen
 - [ ] Consider framebuffer mode for graphics (VESA/GOP)
 
 ## Keyboard

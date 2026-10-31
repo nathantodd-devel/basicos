@@ -6,6 +6,7 @@
 #   make run          - boot debug ISO in QEMU, with the test disk attached
 #   make run-release  - boot release ISO in QEMU, with the test disk attached
 #   make shell-test   - boot headless and test the userspace shell and process isolation
+#   make vga-test     - boot headless and test the screen and keyboard console
 #   make gdb          - boot debug ISO in QEMU, halted, waiting for GDB on :1234
 #   make disk         - create build/disk.img (2G, FAT32) if it doesn't exist
 #   make disk-reset   - wipe and recreate build/disk.img from scratch
@@ -133,7 +134,7 @@ NET_TEST_SECONDS ?= 5
 QEMU_FLAGS  := -m 256M -serial stdio -boot d -drive file=$(DISK_IMG),format=raw,if=ide,index=0 \
                -netdev user,id=n0 -device rtl8139,netdev=n0
 
-.PHONY: all debug release kernel-bin kernel-release iso iso-release run run-release gdb net-test posix-test shell-test ext4-test feature-check \
+.PHONY: all debug release kernel-bin kernel-release iso iso-release run run-release gdb net-test posix-test shell-test vga-test ext4-test feature-check \
         disk disk-reset initrd initrd-reset reset-disks testprog forktest userland init-elf rust-programs new-prog \
         clean size FORCE
 
@@ -332,6 +333,11 @@ posix-test: iso disk
 # out (tools/shell-test.py). Needs python3 + qemu.
 shell-test: iso disk
 	python3 tools/shell-test.py $(DEBUG_ISO) $(DISK_IMG)
+
+# Boot headless and use the machine as a person at it would: type on the
+# PS/2 keyboard and read VGA memory (tools/vga-test.py). Needs python3 + qemu.
+vga-test: iso disk
+	python3 tools/vga-test.py $(DEBUG_ISO) $(DISK_IMG)
 
 # Boot headless with real ext4 volumes (whole-disk with a dirty journal,
 # MBR- and GPT-partitioned) attached beside the FAT32 disk, and check

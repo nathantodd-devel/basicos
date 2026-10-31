@@ -91,6 +91,10 @@ static LOG_BUFFER: Spinlock<LogRingBuffer<LOG_BUFFER_SIZE>> =
 /// Messages with level <= this value are displayed on console.
 static CONSOLE_LOG_LEVEL: AtomicU8 = AtomicU8::new(LogLevel::Info as u8);
 
+/// Threshold for the VGA screen, on top of `CONSOLE_LOG_LEVEL`. Lowered
+/// once boot is over, when the screen belongs to the shell.
+static VGA_LOG_LEVEL: AtomicU8 = AtomicU8::new(LogLevel::Debug as u8);
+
 /// Enable/disable VGA output.
 static VGA_ENABLED: AtomicBool = AtomicBool::new(true);
 
@@ -121,7 +125,8 @@ impl Write for ConsoleWriter {
         // Only output to console if level <= threshold
         let threshold = CONSOLE_LOG_LEVEL.load(Ordering::Relaxed);
         if (self.level as u8) <= threshold {
-            if VGA_ENABLED.load(Ordering::Relaxed) {
+            let vga_threshold = VGA_LOG_LEVEL.load(Ordering::Relaxed);
+            if VGA_ENABLED.load(Ordering::Relaxed) && (self.level as u8) <= vga_threshold {
                 let _ = VgaWriter.write_str(s);
             }
             if SERIAL_ENABLED.load(Ordering::Relaxed) {
@@ -229,6 +234,12 @@ pub fn get_console_log_level() -> LogLevel {
         6 => LogLevel::Info,
         _ => LogLevel::Debug,
     }
+}
+
+/// Show only messages at `level` or more serious on the VGA screen. Serial
+/// and the log buffer aren't affected.
+pub fn set_vga_log_level(level: LogLevel) {
+    VGA_LOG_LEVEL.store(level as u8, Ordering::Relaxed);
 }
 
 /// Enable or disable VGA output.

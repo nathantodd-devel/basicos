@@ -79,10 +79,15 @@ fn init_dynamic() -> usize {
     // actually lands — that finds the largest surviving contiguous
     // block without needing a "what's my biggest run" query this
     // allocator doesn't have.
+    //
+    // Start from half of free memory, not all of it: every process's pages
+    // and page tables come from what's left. Claiming everything meant the
+    // split depended on where the largest run happened to fall, so a
+    // change in the kernel's size could leave processes a few MiB, and
+    // `exec` failing for want of frames.
     const MIN_HEAP_FRAMES: usize = 256; // 1 MiB — the old fixed size, as a floor
-    const RESERVE_FRAMES: usize = 256; // 1 MiB left free for frame use later on
 
-    let mut want = frame::free_count().saturating_sub(RESERVE_FRAMES);
+    let mut want = frame::free_count() / 2;
     let frame = loop {
         assert!(
             want >= MIN_HEAP_FRAMES,
@@ -125,7 +130,11 @@ impl ListNode {
 }
 
 /// First-fit free-list allocator. `head` is a dummy node whose `next`
-/// points at the first real free block; the list is otherwise unordered.
+/// points at the first real free block. The list is kept in address order
+/// so that a freed block merges with its neighbours: without that, every
+/// split is permanent, and enough mixed-size traffic (a network soak does
+/// it in about 65,000 packets) shreds the heap until a small allocation
+/// fails with most of it free.
 struct LinkedListAllocator {
     head: ListNode,
 }
@@ -146,7 +155,8 @@ impl LinkedListAllocator {
         self.add_free_region(heap_start, heap_size);
     }
 
-    /// Push a region of memory onto the front of the free list.
+    /// Return a region of memory to the free list, merging it with the
+    /// free blocks on either side if they touch.
     ///
     /// # Safety
     /// The region must be valid, unused, correctly aligned for
@@ -155,11 +165,31 @@ impl LinkedListAllocator {
         assert_eq!(align_up(addr, mem::align_of::<ListNode>()), addr);
         assert!(size >= mem::size_of::<ListNode>());
 
-        let mut node = ListNode::new(size);
-        node.next = self.head.next.take();
+        let mut prev: *mut ListNode = &mut self.head;
+        while let Some(node) = (*prev).next.as_deref_mut() {
+            if node.start_addr() > addr {
+                break;
+            }
+            prev = node;
+        }
+
+        let mut size = size;
+        let mut next = (*prev).next.take();
+        if let Some(node) = next.take_if(|n| n.start_addr() == addr + size) {
+            size += node.size;
+            next = node.next.take();
+        }
+
+        // `head`, the only node of size 0, is never a neighbour.
+        if (*prev).size != 0 && (*prev).end_addr() == addr {
+            (*prev).size += size;
+            (*prev).next = next;
+            return;
+        }
+
         let node_ptr = addr as *mut ListNode;
-        node_ptr.write(node);
-        self.head.next = Some(&mut *node_ptr);
+        node_ptr.write(ListNode { size, next });
+        (*prev).next = Some(&mut *node_ptr);
     }
 
     /// Find a free region big enough for `size`/`align`, unlink it from
@@ -182,9 +212,14 @@ impl LinkedListAllocator {
 
     /// Check whether `region` can satisfy an allocation of `size`/`align`,
     /// rejecting it if the leftover space would be nonzero but too small
-    /// to host a `ListNode` (we'd otherwise leak that tail forever).
+    /// to host a `ListNode` (we'd otherwise leak that tail forever). The
+    /// gap alignment leaves in front has to be able to host one too.
     fn alloc_from_region(region: &ListNode, size: usize, align: usize) -> Result<usize, ()> {
-        let alloc_start = align_up(region.start_addr(), align);
+        let start = region.start_addr();
+        let mut alloc_start = align_up(start, align);
+        if alloc_start != start && alloc_start - start < mem::size_of::<ListNode>() {
+            alloc_start = align_up(start + mem::size_of::<ListNode>(), align);
+        }
         let alloc_end = alloc_start.checked_add(size).ok_or(())?;
 
         if alloc_end > region.end_addr() {
@@ -218,9 +253,12 @@ unsafe impl GlobalAlloc for Spinlock<LinkedListAllocator> {
 
         if let Some((region, alloc_start)) = allocator.find_region(size, align) {
             let alloc_end = alloc_start.checked_add(size).expect("overflow");
-            let excess_size = region.end_addr() - alloc_end;
-            if excess_size > 0 {
-                allocator.add_free_region(alloc_end, excess_size);
+            let (region_start, region_end) = (region.start_addr(), region.end_addr());
+            if region_end > alloc_end {
+                allocator.add_free_region(alloc_end, region_end - alloc_end);
+            }
+            if alloc_start > region_start {
+                allocator.add_free_region(region_start, alloc_start - region_start);
             }
             alloc_start as *mut u8
         } else {
