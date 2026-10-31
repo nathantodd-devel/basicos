@@ -18,6 +18,8 @@ mod elf;
 mod fs;
 mod log;
 mod mem;
+#[cfg(feature = "net")]
+mod net;
 mod panic;
 #[cfg(feature = "scheduler")]
 mod sched;
@@ -116,7 +118,10 @@ pub extern "C" fn kernel_main(magic: u64, mb_info_addr: u64) -> ! {
     // `frame::allocate()` to never hand out a frame from inside the zone
     // for its own bookkeeping).
     #[cfg(feature = "elf-loader")]
-    mem::paging::demote_process_zone();
+    {
+        mem::paging::demote_process_zone();
+        mem::paging::protect_kernel_mappings();
+    }
 
     unsafe { gdt::init() };
     pr_info!("GDT + TSS loaded");
@@ -156,9 +161,30 @@ pub extern "C" fn kernel_main(magic: u64, mb_info_addr: u64) -> ! {
             }
             None => pr_info!("B: no initrd module supplied by bootloader"),
         }
-        match fs::init_disk() {
-            Ok(()) => pr_info!("C: mounted FAT32 volume on primary ATA drive"),
-            Err(e) => pr_warn!("C: {}", e),
+        // Every ATA disk, and every partition on it, that holds a FAT32
+        // or ext4 filesystem gets the next drive letter from C:.
+        let mut mounted = 0;
+        for r in fs::mount_disks() {
+            match r {
+                Ok(m) => {
+                    mounted += 1;
+                    pr_info!(
+                        "{}: mounted {} {}{} ({} MiB, {}, {}){}",
+                        m.drive.letter(),
+                        m.fs_type,
+                        if m.label.is_empty() { "volume" } else { "volume " },
+                        m.label,
+                        m.bytes >> 20,
+                        m.source,
+                        if m.read_only { "read-only" } else { "read-write" },
+                        m.note.map(|n| alloc::format!(" — {}", n)).unwrap_or_default()
+                    )
+                }
+                Err(why) => pr_warn!("disk: {}", why),
+            }
+        }
+        if mounted == 0 {
+            pr_warn!("no disk volumes mounted (no ATA disk with a FAT32/ext4 filesystem found)");
         }
     }
 
@@ -176,20 +202,46 @@ pub extern "C" fn kernel_main(magic: u64, mb_info_addr: u64) -> ! {
     let brand = cpu_info::get_cpu_brand();
     pr_info!("CPU: {} - {}", vendor.as_str(), brand.as_str());
 
+    // Boot tail. Exactly one of these arms diverges, whatever the feature
+    // set (see `make feature-check`):
+    //   scheduler on        -> spawn what's enabled, then `sched::run()`
+    //   usermode-demo only  -> one-way jump to the ring-3 demo
+    //   neither             -> halt
+    #[cfg(feature = "scheduler")]
+    {
+        // Networking: find a NIC and spawn the `net` task (must come
+        // before `sched::run()` below, which never returns).
+        #[cfg(feature = "net")]
+        net::init();
+
+        // The first user process: C:/INIT.ELF. Everything else in
+        // userspace, the shell included, is started by it.
+        #[cfg(feature = "elf-loader")]
+        {
+            let _pid = elf::spawn("init", "C:/INIT.ELF").expect("INIT.ELF required for boot");
+        }
+
+        // The ring-0 debug monitor (off by default — see `shell`).
+        #[cfg(feature = "shell")]
+        sched::spawn("shell", shell::shell_task);
+
+        // Without init or a shell there'd be nothing to look at — run the
+        // two preemption demo tasks instead.
+        #[cfg(not(any(feature = "elf-loader", feature = "shell")))]
+        {
+            sched::spawn("demo-a", sched::demo_task_a);
+            sched::spawn("demo-b", sched::demo_task_b);
+        }
+
+        sched::run();
+    }
+
     #[cfg(all(not(feature = "scheduler"), feature = "usermode-demo"))]
     {
         pr_notice!("Jumping to ring 3...");
         let stack_top =
             unsafe { core::ptr::addr_of!(USER_STACK.0) as u64 + USER_STACK_SIZE as u64 };
         unsafe { gdt::jump_to_ring3(usermode::user_mode_stub, stack_top) }
-    }
-
-    // find a C:/init.elf and run it
-
-    #[cfg(feature = "elf-loader")]
-    {
-        let _pid = elf::spawn("init", "C:/INIT.ELF").expect("INIT.ELF required for boot");
-        sched::run();
     }
 
     #[cfg(all(not(feature = "scheduler"), not(feature = "usermode-demo")))]

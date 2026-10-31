@@ -3,7 +3,30 @@
 version = 4
 
 [[package]]
+name = "arp"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]
+
+[[package]]
+name = "bash"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]
+
+[[package]]
 name = "basicos"
+version = "0.1.0"
+dependencies = [
+ "basicos-ext4",
+ "basicos-fs",
+ "basicos-net",
+]
+
+[[package]]
+name = "basicos-ext4"
 version = "0.1.0"
 dependencies = [
  "basicos-fs",
@@ -14,8 +37,40 @@ name = "basicos-fs"
 version = "0.1.0"
 
 [[package]]
+name = "basicos-net"
+version = "0.1.0"
+
+[[package]]
 name = "basicos-sdk"
 version = "0.1.0"
+
+[[package]]
+name = "cat"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]
+
+[[package]]
+name = "clear"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]
+
+[[package]]
+name = "date"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]
+
+[[package]]
+name = "drives"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]
 
 [[package]]
 name = "forkwait"
@@ -39,6 +94,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ifconfig"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]
+
+[[package]]
 name = "init"
 version = "0.1.0"
 dependencies = [
@@ -46,7 +108,91 @@ dependencies = [
 ]
 
 [[package]]
+name = "isotest"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]
+
+[[package]]
 name = "ls"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]
+
+[[package]]
+name = "meminfo"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]
+
+[[package]]
+name = "mkdir"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]
+
+[[package]]
+name = "mv"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]
+
+[[package]]
+name = "ping"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]
+
+[[package]]
+name = "posix"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]
+
+[[package]]
+name = "ps"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]
+
+[[package]]
+name = "rm"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]
+
+[[package]]
+name = "rmdir"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]
+
+[[package]]
+name = "udpecho"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]
+
+[[package]]
+name = "uptime"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]
+
+[[package]]
+name = "write"
 version = "0.1.0"
 dependencies = [
  "basicos-sdk",

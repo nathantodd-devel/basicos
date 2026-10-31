@@ -1,7 +1,5 @@
 //! Exception handlers, IRQ handlers, and interrupt subsystem init.
 
-use alloc::format;
-
 #[cfg(feature = "pit-100hz")]
 use super::pit;
 #[cfg(feature = "keyboard")]
@@ -39,7 +37,34 @@ pub const TIMER_HZ: u32 = 18;
 
 // --- CPU exceptions (vectors 0-31) --------------------------------------
 
+/// If a fault came from ring 3 it's that program's bug, not the kernel's:
+/// end just that process, with the status a shell shows for death by
+/// `signal`, and keep going. Returns (only) for a fault in the kernel.
+fn kill_if_user(frame: &InterruptStackFrame, what: &str, signal: i32) {
+    #[cfg(feature = "elf-loader")]
+    if frame.code_segment & 3 == 3 {
+        pr_err!(
+            "pid {}: {} at {:#x}, killed",
+            crate::sched::current_pid(),
+            what,
+            frame.instruction_pointer
+        );
+        // We came from user mode, so no kernel lock is held and nothing
+        // here can return: this frame is simply abandoned.
+        enable();
+        crate::sched::exit_process(128 + signal);
+    }
+    #[cfg(not(feature = "elf-loader"))]
+    let _ = (frame, what, signal);
+}
+
+const SIGILL: i32 = 4;
+const SIGBUS: i32 = 7;
+const SIGFPE: i32 = 8;
+const SIGSEGV: i32 = 11;
+
 extern "x86-interrupt" fn divide_error_handler(frame: InterruptStackFrame) {
+    kill_if_user(&frame, "divide error", SIGFPE);
     pr_crit!(
         "EXCEPTION: DIVIDE ERROR at {:#x}",
         frame.instruction_pointer
@@ -70,6 +95,7 @@ extern "x86-interrupt" fn breakpoint_handler(frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn overflow_handler(frame: InterruptStackFrame) {
+    kill_if_user(&frame, "overflow", SIGFPE);
     pr_crit!("EXCEPTION: OVERFLOW at {:#x}", frame.instruction_pointer);
     #[cfg(feature = "bad-interrupt-panic")]
     panic!("EXCEPTION: OVERFLOW at {:#x}", frame.instruction_pointer);
@@ -77,6 +103,7 @@ extern "x86-interrupt" fn overflow_handler(frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn bound_range_handler(frame: InterruptStackFrame) {
+    kill_if_user(&frame, "bound range exceeded", SIGSEGV);
     pr_crit!(
         "EXCEPTION: BOUND RANGE EXCEEDED at {:#x}",
         frame.instruction_pointer
@@ -90,6 +117,7 @@ extern "x86-interrupt" fn bound_range_handler(frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
+    kill_if_user(&frame, "invalid opcode", SIGILL);
     pr_crit!(
         "EXCEPTION: INVALID OPCODE at {:#x}",
         frame.instruction_pointer
@@ -103,6 +131,7 @@ extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn device_not_available_handler(frame: InterruptStackFrame) {
+    kill_if_user(&frame, "FPU instruction", SIGILL);
     pr_crit!(
         "EXCEPTION: DEVICE NOT AVAILABLE (FPU) at {:#x}",
         frame.instruction_pointer
@@ -146,6 +175,7 @@ extern "x86-interrupt" fn invalid_tss_handler(frame: InterruptStackFrame, error_
 }
 
 extern "x86-interrupt" fn segment_not_present_handler(frame: InterruptStackFrame, error_code: u64) {
+    kill_if_user(&frame, "segment not present", SIGSEGV);
     pr_crit!("EXCEPTION: SEGMENT NOT PRESENT");
     pr_crit!("  error_code: {:#x}", error_code);
     pr_crit!("  RIP: {:#x}", frame.instruction_pointer);
@@ -160,6 +190,7 @@ extern "x86-interrupt" fn segment_not_present_handler(frame: InterruptStackFrame
 }
 
 extern "x86-interrupt" fn stack_segment_fault_handler(frame: InterruptStackFrame, error_code: u64) {
+    kill_if_user(&frame, "stack segment fault", SIGSEGV);
     pr_crit!("EXCEPTION: STACK SEGMENT FAULT");
     pr_crit!("  error_code: {:#x}", error_code);
     pr_crit!("  RIP: {:#x}", frame.instruction_pointer);
@@ -177,6 +208,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     frame: InterruptStackFrame,
     error_code: u64,
 ) {
+    kill_if_user(&frame, "general protection fault", SIGSEGV);
     pr_crit!("EXCEPTION: GENERAL PROTECTION FAULT");
     pr_crit!("  error_code: {:#x}", error_code);
     pr_crit!("  RIP: {:#x}", frame.instruction_pointer);
@@ -195,38 +227,22 @@ extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, error_c
     unsafe {
         core::arch::asm!("mov {}, cr2", out(reg) faulting_addr, options(nomem, nostack, preserves_flags));
     }
-    let error = format!(
-        "{}{}{}{}{}",
-        if error_code & 1 != 0 {
-            "protection "
-        } else {
-            "not-present "
-        },
-        if error_code & 2 != 0 {
-            "write "
-        } else {
-            "read "
-        },
-        if error_code & 4 != 0 {
-            "user "
-        } else {
-            "kernel "
-        },
-        if error_code & 8 != 0 {
-            "reserved-bit "
-        } else {
-            ""
-        },
-        if error_code & 16 != 0 {
-            "instruction-fetch"
-        } else {
-            ""
-        }
-    );
-
+    if frame.code_segment & 3 == 3 {
+        pr_err!("page fault on {:#x}", faulting_addr);
+    }
+    kill_if_user(&frame, "segmentation fault", SIGSEGV);
     pr_crit!("EXCEPTION: PAGE FAULT");
     pr_crit!("  faulting address: {:#x}", faulting_addr);
-    pr_crit!("  error: {}", error);
+    // No `format!` here: a fault handler shouldn't allocate (and this
+    // must build without the heap).
+    pr_crit!(
+        "  error: {}{}{}{}{}",
+        if error_code & 1 != 0 { "protection " } else { "not-present " },
+        if error_code & 2 != 0 { "write " } else { "read " },
+        if error_code & 4 != 0 { "user " } else { "kernel " },
+        if error_code & 8 != 0 { "reserved-bit " } else { "" },
+        if error_code & 16 != 0 { "instruction-fetch" } else { "" }
+    );
     pr_crit!("  RIP: {:#x}", frame.instruction_pointer);
 
     #[cfg(feature = "bad-interrupt-panic")]
@@ -241,6 +257,7 @@ extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, error_c
 }
 
 extern "x86-interrupt" fn x87_fpu_error_handler(frame: InterruptStackFrame) {
+    kill_if_user(&frame, "x87 FPU error", SIGFPE);
     pr_crit!(
         "EXCEPTION: x87 FPU ERROR at {:#x}",
         frame.instruction_pointer
@@ -254,6 +271,7 @@ extern "x86-interrupt" fn x87_fpu_error_handler(frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn alignment_check_handler(frame: InterruptStackFrame, error_code: u64) {
+    kill_if_user(&frame, "alignment check", SIGBUS);
     pr_crit!("EXCEPTION: ALIGNMENT CHECK");
     pr_crit!("  error_code: {:#x}", error_code);
     pr_crit!("  RIP: {:#x}", frame.instruction_pointer);
@@ -281,6 +299,7 @@ extern "x86-interrupt" fn machine_check_handler(frame: InterruptStackFrame) -> !
 }
 
 extern "x86-interrupt" fn simd_fpu_error_handler(frame: InterruptStackFrame) {
+    kill_if_user(&frame, "SIMD FPU error", SIGFPE);
     pr_crit!(
         "EXCEPTION: SIMD FLOATING POINT at {:#x}",
         frame.instruction_pointer

@@ -17,9 +17,11 @@ jump.
   handlers for divide error, breakpoint, double fault, GPF, and page fault,
   plus PIT timer and keyboard IRQs remapped through the legacy 8259 PIC
   (`pic.rs`).
-- **SYSCALL/SYSRET** (`arch/x86_64/syscall.rs`, `syscall/mod.rs`) — MSR-based
-  fast syscall entry with a small table (`read`, `write`, `exit`, `getpid`,
-  `sched_yield`, plus a kernel-log syscall) and `errno`-style return codes.
+- **SYSCALL/SYSRET** (`arch/x86_64/syscall.rs`, `syscall/`) — MSR-based
+  fast syscall entry and a Linux-numbered, POSIX-flavoured syscall table
+  (~90 calls: files, directories, per-process fds, pipes, `poll`, fork/
+  exec/wait/kill, clocks, UDP and raw sockets — see "Syscalls" below) with
+  `-errno` return codes.
 - **Kernel log** (`log.rs`) — `printk`-style leveled logging (`pr_emerg!` …
   `pr_debug!`) with prefixes, a ring buffer, runtime log-level filtering, and
   independently toggleable VGA/serial sinks.
@@ -40,15 +42,58 @@ jump.
   threads, with a real preemptive round-robin scheduler (an xv6-style minimal
   context switch, triggered from the timer IRQ, not just cooperative
   yielding).
-- **Shell** (`shell/`) — a small interactive command shell (`help`, `ls`,
-  `cat`, `run`, ...) running as a scheduler task, over serial or the keyboard.
+- **Init and the shell** — the kernel starts one user process, `C:/INIT.ELF`.
+  init starts the shell (`programs/bash`) on the console, restarts it on
+  logout, and reaps orphans. Commands (`ls`, `cat`, `ps`, `ping`, ...) are
+  ordinary programs in `C:/BIN/`; kernel state reaches them through `/proc`.
+  `shell/` is an optional ring-0 debug monitor, off by default.
+- **Process isolation** — ring 3 can reach only its own pages, not kernel
+  memory or page 0, and a fault in a process kills that process, not the
+  kernel. If init itself dies, the kernel panics.
 - **ELF loader** (`elf/`) — parses a standalone ET_EXEC/x86_64 binary, loads
-  its PT_LOAD segments, and jumps to it in ring 3 (the shell's `run`
-  command). `testprog.s`/`testprog.ld` build a real test binary, entirely
+  its PT_LOAD segments, and runs it in ring 3. `testprog.s`/`testprog.ld` build a real test binary, entirely
   outside the kernel image, to exercise it against.
+
+- **Networking** (`net/`, `kernel/src/net/`, `drivers/{pci,rtl8139}.rs`) — PCI
+  enumeration, a polled RTL8139 NIC driver, and an IPv4 stack (Ethernet,
+  ARP, IPv4, ICMP echo, UDP, loopback). The protocol logic is the
+  hardware-free `basicos-net` crate, unit-tested on the host; the kernel
+  glues it to the NIC. Shell commands `ifconfig`, `arp`, `ping`; a UDP echo
+  service on port 7. Static addressing for now (QEMU user-net's
+  10.0.2.15/24). No TCP yet.
 
 None of this is meant to be production-grade — it's a from-scratch
 exploration of what a kernel needs to do to get from firmware to ring 3.
+
+## Syscalls
+
+Linux x86_64 numbers and struct layouts (`stat`, `dirent64`, `sockaddr_in`,
+`pollfd`, `termios`, ...), so C programs written against `<fcntl.h>`/
+`<sys/socket.h>` constants work; user pointers are validated (a bad one is
+`EFAULT`, not a kernel crash). Each process has its own fd table (64 slots),
+inherited across `fork`, with `dup`-shared file descriptions.
+
+| Area | Calls |
+|---|---|
+| Files | `open`/`openat` (`O_CREAT/EXCL/TRUNC/APPEND/NONBLOCK/CLOEXEC/DIRECTORY`), `close`, `read`/`write`, `readv`/`writev`, `pread64`/`pwrite64`, `lseek`, `stat`/`lstat`/`fstat`/`newfstatat`, `access`, `ftruncate`/`truncate`, `fsync`, `getdents64` |
+| Directories | `mkdir`/`mkdirat`, `rmdir`, `unlink`/`unlinkat`, `rename`, `chdir`, `getcwd` (relative paths, `.`/`..`) |
+| Descriptors | `dup`/`dup2`/`dup3`, `fcntl` (`F_DUPFD`, `F_GETFD/SETFD`, `F_GETFL/SETFL`), `ioctl` (tty queries, `FIONREAD`), `pipe`/`pipe2`, `poll`, `umask` |
+| Processes | `fork`, `execve`, `wait4`, `exit`/`exit_group`, `getpid`/`getppid`, `kill` (fatal signals terminate; no handlers), `sched_yield`, `brk`, anonymous `mmap`/`munmap`, `getuid` family (always root) |
+| Time / system | `clock_gettime`/`clock_getres`, `gettimeofday`, `time`, `nanosleep`/`clock_nanosleep`, `uname`, `sysinfo`, `getrandom` |
+| Sockets (UDP, raw IP) | `socket`, `bind`, `connect`, `sendto`, `recvfrom`, `getsockname`/`getpeername`, `setsockopt` (`SO_RCVTIMEO`)/`getsockopt`, `shutdown`; `read`/`write`/`poll` work on them too |
+| basicos-specific | `klog` (0x400), `tree` (0x401), `kpanic` (0x402) |
+
+Devices: `/dev/null`, `/dev/zero`, `/dev/random`/`urandom` (xorshift — not
+cryptographic), `/dev/tty`/`/dev/console`; fds 0/1/2 start on the console,
+with a cooked-mode line discipline for stdin (echo, backspace, Ctrl-D EOF).
+
+What isn't there (yet): signal *handlers* (`rt_sigaction`), threads/`futex`,
+TCP (`SOCK_STREAM` is `ESOCKTNOSUPPORT`), file-backed `mmap`, `select`/
+`epoll`, long file names, real timestamps in `stat`.
+
+`make posix-test` runs `programs/posix` — a self-checking program with ~100
+checks over all of the above — in headless QEMU; `make net-test` covers the
+NIC and sockets end to end.
 
 ## Cargo features
 
@@ -68,11 +113,14 @@ module and nothing references it.
 | `serial-input` | Serial (COM1) *input* — output (kernel logging) is always on |
 | `pit-100hz` | Reprogram the PIT to 100 Hz; off = its ~18.2 Hz power-on default |
 | `apic` | Local APIC driver (`arch::x86_64::apic`) — not wired into boot either way; available infrastructure |
-| `usermode-demo` | SYSCALL/SYSRET setup, the syscall dispatch table, and the ring-3 demo program that exercises it |
+| `usermode-demo` | SYSCALL/SYSRET setup, the syscall dispatch table (per-process fd tables, pipes, ...), the RTC, and the ring-3 demo program that exercises it (implies `heap`) |
 | `scheduler` | Process/task abstraction + preemptive round-robin scheduler for ring-0 kernel threads (`sched/`) — takes over kernel_main's boot tail from `usermode-demo` when both are on |
-| `shell` | The interactive shell (`shell/`) — implies `scheduler`, since it runs as a task |
-| `elf-loader` | ELF64 loader + one-shot ring-3 exec (`elf/`), used by the shell's `run` command (implies `usermode-demo` + `storage`) |
+| `shell` | Ring-0 debug monitor (`shell/`), **off by default**: it competes with the userspace shell for console input. Implies `scheduler`, since it runs as a task |
+| `net` | PCI + RTL8139 driver + the `basicos-net` IPv4 stack, polled by a `net` scheduler task (implies `heap` + `frame-alloc` + `scheduler`) |
+| `elf-loader` | ELF64 loader + one-shot ring-3 exec (`elf/`), used to start init and by `execve` (implies `usermode-demo` + `storage`) |
 
+Every combination is meant to build — `make feature-check` compiles a
+matrix of them (none, each alone, all-but-one) so a broken gate is caught.
 Build a reduced kernel with `--no-default-features --features <list>`, or
 override the Makefile's `FEATURES` variable:
 
@@ -80,11 +128,12 @@ override the Makefile's `FEATURES` variable:
 make FEATURES="--no-default-features --features heap,keyboard"
 ```
 
-With `scheduler` on (the default), the kernel drops into an interactive
-shell after boot instead of running the fixed `usermode-demo` program — the
-two don't compose (see `sched`'s module docs for why), and ring-3 programs
-launched from the shell (`run <path>`) are real, preemptible scheduler tasks
-with their own address space, not a one-way jump. Disabling both `scheduler`
+With `scheduler` on (the default), the kernel starts `C:/INIT.ELF` (with
+`elf-loader`), and everything else in userspace comes from init, instead of
+running the fixed `usermode-demo` program — the two don't compose (see
+`sched`'s module docs for why). Programs are real, preemptible scheduler
+tasks with their own address spaces. With neither `elf-loader` nor `shell`, two demo
+tasks show preemption. Disabling both `scheduler`
 and `usermode-demo` is the most visible change from there — the kernel
 finishes its boot sequence and just halts. See `[features]` in
 `kernel/Cargo.toml` for the exact dependency graph.
@@ -102,7 +151,7 @@ finishes its boot sequence and just halts. See `[features]` in
 ```sh
 make new-prog NAME=foo      # scaffolds programs/foo (8.3-safe names only)
 $EDITOR programs/foo/src/main.rs
-make disk && make run       # then in the shell: run C:/BIN/FOO.ELF
+make disk && make run       # then in the shell: foo
 ```
 
 A program is `#![no_std]`/`#![no_main]`, calls `basicos_sdk::entry!(main)`,
@@ -162,7 +211,7 @@ features, so a floating `nightly` can break it); bump it with
 ## Project layout
 
 A Cargo workspace (root [`Cargo.toml`](Cargo.toml) is a virtual manifest —
-`[workspace] members = ["kernel", "fs", "init"]`), plus non-Cargo pieces that build
+`[workspace] members = ["kernel", "fs", "net", "sdk", "init", "programs/*"]`), plus non-Cargo pieces that build
 through the top-level `Makefile`:
 
 ```
@@ -188,7 +237,7 @@ kernel/                 The OS itself — a #![no_std] crate, custom target
     usermode/            ring-3 entry stub (usermode-demo)
     sched/               process/task abstraction, round-robin scheduler,
                          fork/exec/wait support
-    shell/               interactive command shell
+    shell/               ring-0 debug monitor (off by default)
     elf/                 ELF64 loader
 
 fs/                     `basicos-fs` — the FAT32 format, decoupled from the
@@ -200,6 +249,13 @@ fs/                     `basicos-fs` — the FAT32 format, decoupled from the
     fat32.rs             Parsing, directory walks, read/write
     ramdisk.rs           From-scratch FAT32 "mkfs" over a BlockDevice
     block.rs             The BlockDevice trait + MemDisk
+
+net/                    `basicos-net` — the IPv4 stack as a sans-IO state
+                        machine (Ethernet, ARP, IPv4, ICMP, UDP, loopback;
+                        `Stack` + the `NetDevice` trait the NIC driver
+                        implements). Host-target, no_std, unit-tested with
+                        a bare `cargo test`; `make net-test` boots the
+                        kernel and checks it end to end against QEMU.
 
 sdk/                    `basicos-sdk` — the Rust userspace SDK (there is no
                         `std` for basicos; this is core + alloc + the
@@ -213,10 +269,15 @@ sdk/                    `basicos-sdk` — the Rust userspace SDK (there is no
 init/                   The first userspace program, built on the SDK.
                         `make init-elf`; on the disk as C:\INIT.ELF.
 programs/               Every other Rust userspace program, one crate each
-                        (hello, ls, heap, forkwait). `make new-prog
+                        (hello, ls, heap, forkwait, posix — the syscall
+                        self-test, udpecho — a UDP echo server). `make new-prog
                         NAME=foo` scaffolds one; everything here is built
                         and copied onto the disk as C:\BIN\<NAME>.ELF by
                         `make disk`, no Makefile edit needed.
+
+tools/                  Test drivers: `feature-check.sh` (feature matrix),
+                        `shell-test.py`, `posix-test.py`, `ext4-test.py`, `net-test.py` (headless QEMU runs;
+                        `qemu-shell.py` is their shared helper).
 
 userland/               Freestanding C programs against the kernel's own
                         syscall ABI (syscalls.h) — not a Cargo crate; see

@@ -29,16 +29,22 @@
 - [x] Add process/task abstraction — `sched::Task` (ring-0 kernel threads) plus real ring-3 **processes** with their own address space, pid/ppid, and per-task kernel/syscall stack (see the next few items — this used to be ring-0-only, see the git history for that caveat)
 - [x] Implement scheduler (round-robin to start) — real preemption: an xv6-style minimal context switch (callee-saved regs + RSP only), triggered every PIT tick from the timer IRQ, not just cooperative yielding. Verified by two tasks that never call `yield_now()` themselves, whose output still interleaves. Found and fixed two real bugs along the way: RFLAGS.IF isn't part of the saved context (it's a single CPU-wide flag, not per-task), so a task preempted mid-interrupt-handler was leaving IF stuck at 0 for whatever ran next — fixed by an unconditional `sti` inside `switch()` (**later replaced** — see the next item); and `log.rs` wasn't holding a lock across a whole log line (just the ring-buffer write), so two tasks' output could interleave mid-word once real preemption existed to expose it — fixed by disabling interrupts for each `pr_*!`/`kprint!` call's full duration
 - [x] Scheduler race: `switch()`'s blanket `sti` let a timer tick land while the CPU was in scheduler context (or mid-switch into it), where `CURRENT` says a task is running but none is. `yield_now` then saved the *scheduler's* RSP into that task's slot, and the next switch into it popped garbage off the boot stack and `ret`ed into `.bss` (`INVALID OPCODE` right after `SCHED_RSP`). Latent since the `sti` was added; exposed once init was the *only* task, sitting in a tight `yield` loop so the scheduler switched constantly (the shell and demo tasks had been diluting it). Found by tracing QEMU's exceptions (`-d int`): the tick was delivered on the instruction right after `switch`'s `sti`, with SP on the boot stack. Fixed properly rather than patched: `switch()` now saves/restores RFLAGS (`pushfq`/`popfq`) so each context resumes with its own interrupt state, new tasks start with an `INITIAL_RFLAGS` slot, and `run()` executes with interrupts off, using an atomic `sti; hlt` only to idle. Verified: six ~700-tick boots of init alone (previously dead in 20 ms) plus the full fork/exec/mmap/file-I/O regression with the shell and demo tasks running alongside
+- [x] Scheduler race #2: `yield_now` marked the task `Ready` and *then* switched, with interrupts still on. A timer tick in that window ran a nested `yield_now`, which switched away, got the task rescheduled (`Running` again), and resumed the outer call — which switched away a second time still marked `Running`, so `pick_next` (Ready-only) never ran the task again and the scheduler idled forever. Needs a task that yields constantly to hit reliably; found when the `net` polling task went silent a few seconds after boot (RIP sampled through the QEMU monitor sat in `sched::run`'s `hlt`: no Ready tasks). Fixed by disabling interrupts from before the state change until after the switch returns (restoring the caller's IF afterwards). Verified: 3 idle 10 s boots, plus ~22k UDP round-trips through the net task. (This fix had gone missing from `yield_now` and has been put back)
+- [x] Intermittent crash in `forkwait` (fork + exec), about one boot in two: ring-3 code jumping to `0x3` or faulting in `hello`. `execve` found its syscall frame through a global that every syscall overwrote, and it read that global only after copying argv in, long enough for a tick to let another process (init, spinning on `wait`) overwrite it. `execve` then redirected the wrong process and returned into its own unmapped image. The IVT pattern in the old notes was a clue to a second problem: page 0 was mapped and user-readable. Fixed by deriving the frame from the running task's own kernel stack (`arch::x86_64::syscall::current_frame`), so there's no global to overwrite. Measured with 3 runs per boot: 6/12 boots failed before, 0/12 after
 - [x] Per-process address spaces — `mem::paging`'s process zone: `entrypoint.s`'s boot-time 2 MiB huge pages covering a fixed 16 MiB virtual slice (`PROC_ZONE_START`) get demoted to real 4 KiB page tables once, at boot (`demote_process_zone`), so each process (`PageMapper::new_process_space`/`fork_from`) can get its own private physical backing there — code, heap, mmap arena, and stack all live inside it — while everything else (kernel code/data/heap, page tables themselves) stays the single shared mapping every address space inherits by construction. Physical range reserved from `frame::allocate()` up front, which is what makes it sound for kernel code to `memcpy` into a freshly allocated frame via a raw physical pointer regardless of whose CR3 is currently loaded
 - [x] Per-task kernel stack + `TSS.RSP0`/syscall-stack switching — closes the exact gap the scheduler used to have: `run()` now points `TSS.RSP0` (`gdt::set_kernel_stack`) and `syscall_entry`'s own stack target (`arch::x86_64::syscall::set_kernel_stack_top`) at whichever task is about to run, and reloads CR3 too, on *every* switch — a ring-3 process's own syscalls and any interrupt that catches it in ring 3 land on its own stack, not a shared one
 - [x] ELF loader for userspace binaries — `elf::load_into`: parses ET_EXEC/EM_X86_64, copies PT_LOAD segments into a process's own address space (via its page-table walk, not a raw physical pointer — correct regardless of which CR3 is loaded). `elf::spawn`/`sched::spawn_process` load a binary and queue it as a real scheduler task (not a one-way trip anymore). Verified against two standalone binaries built completely outside the kernel: `testprog.s` (`make testprog` → `/hello.elf`) and `forktest.s` (`make forktest` → `/forktest.elf`, see below)
 - [x] `fork()`/`execve()`/`wait4()` — real process duplication and image replacement, not stubs. `fork()` deep-copies the calling process's address space (`PageMapper::fork_from`, full copy, not copy-on-write) and splices a copy of its in-flight syscall register frame onto the child's own stack (`arch::x86_64::syscall::fork_child_entry`/`SyscallFrame`) so it resumes exactly where the parent called `fork()`, with RAX forced to 0. `execve()` tears down the caller's own memory (`PageMapper::unmap_zone`) and loads a fresh ELF into the same address space, redirecting the in-flight syscall's saved RIP/RSP instead of returning to the old program. `wait4()`/`sched::wait_for_child` blocks (a plain yield loop) until a zombie child shows up, reaps it, and returns its exit status. All four verified together end to end in QEMU via `forktest.elf`: fork → child execs into `hello.elf` (proving the teardown/reload is real, not a no-op) → child exits → parent reaps it via `wait4` — and `meminfo` shows byte-identical free frame counts before and after, confirming the address-space cleanup on `exit()`/`execve()` doesn't leak
 - [x] `mmap()`/`munmap()`/`brk()` — anonymous-only (no page cache, so no file-backed mappings — `MAP_ANONYMOUS` or `EINVAL`); `mmap` bump-allocates from a per-process mmap arena, `brk` grows/shrinks a per-process heap region, both backed by real `alloc_and_map`/`unmap_and_free` calls into the calling process's own address space. Verified in `forktest.elf`: grows the heap, writes/reads a distinct value through the new page, maps an anonymous page, writes/reads a different value through *that*, unmaps it
 - [x] Basic shell — `shell::shell_task`, runs as a scheduler task; `help`/`echo`/`clear`/`uptime`/`ps`/`meminfo`/`ls`/`cat`/`run`. Reads from serial if available, else keyboard. Enabling `scheduler` supersedes `usermode-demo`'s boot-time ring-3 jump (see `Cargo.toml`) — the two don't compose, and a shell is more useful as the default than a fixed demo. `run` now spawns a real background process (`elf::spawn`) instead of a one-way jump — the shell keeps running concurrently
-- [ ] The shell doesn't reap its own spawned children — every `run` leaves a permanent zombie task slot once the process exits (nobody calls `wait()` on it). Harmless in practice (`ps` shows it as `Zombie` forever) but with `MAX_TASKS = 8`, running `run` more than a handful of times without anything reaping in between will exhaust the task table (`NoTaskSlots`). Needs either the shell backgrounding + reaping on the next prompt, or a `jobs`/foreground-wait command
+- [x] Zombies from kernel-started processes — anything the kernel starts is now init's child (`spawn_process`), so init reaps it. `MAX_TASKS` is 32
 - [ ] `fork()` is a full deep copy of the process's address space, not copy-on-write — correct, but means a large process's `fork()` is O(its memory), same as the mmap arena's "no reuse on `munmap`" simplification elsewhere. COW would need write-protecting the shared pages and a real page-fault handler integration; not done here
-- [ ] No per-process file descriptor table — `syscall::OPEN_FILES` is still one global array shared by every process (predates this session's fork/exec work). A forked child currently doesn't get its own fd table the way real UNIX processes do; not exercised by anything yet since `forktest.elf` doesn't open files
-- [ ] An unhandled fault in *any* ring-3 process halts the *entire kernel* — every CPU exception handler's fallback (`halt_loop()`) is an unconditional `cli;hlt` loop with no per-process recovery, so one process's bug (found via a user-added `userland/segv.c`, a deliberate null-pointer write) freezes the shell and every other task too, not just the faulting one. Pre-existing, not something this session's fork/exec/mmap work introduced or fixed — a real OS would kill just the offending process (`sched::exit_process` already exists and is exactly the mechanism a real fault handler would call) and keep the scheduler running
+- [x] Per-process file descriptor tables — see Syscalls
+- [x] A fault in ring 3 kills only that process (`interrupts::kill_if_user`), with status 128 + the signal the shell reports. Faults in ring 0 still halt. Verified by `userland/segv.c` and `programs/isotest` via `make shell-test`
+- [x] User/kernel memory isolation — `paging::protect_kernel_mappings` clears the user bit on everything outside the process zone, so ring 3 can only reach its own pages; page 0 is unmapped entirely. Mutation-checked with `make shell-test`
+- [ ] A process that hits the frame limit can panic the kernel: `fork_from`, `new_process_space` and `setup_stack` `.expect()` their allocations instead of returning `ENOMEM`. Reachable with a fork bomb of large processes
+- [ ] User pages are all RWX: no NXE, and ELF segments share pages (`sdk/link.ld` doesn't page-align them), so text isn't read-only and stacks are executable. SMEP/SMAP aren't enabled either
+- [ ] No guard pages on the 16 KiB kernel stacks: an overflow silently corrupts the neighbouring task's stack
 
 ### Two real bugs found building `userland/` (a C toolchain against these syscalls)
 
@@ -53,8 +59,8 @@ Both were silent, not crashes — the kind that only show up once something exer
 - [x] Rust userspace SDK + toolchain (`sdk/`, `programs/`) — init's inlined runtime generalized so writing a Rust program for basicos is `make new-prog NAME=foo`. `basicos-sdk`: typed wrappers over every syscall (`fs::File`/`read_dir`, `process::{fork,exec,wait,exit}`, `mem::{brk,mmap}`, `io`/`print!`), an `entry!` macro (emits `_start` into the *program's* object — defining it in the SDK relies on the linker happening to pull in that archive member), and a `#[global_allocator]` (address-ordered first-fit free list with coalescing, grows via `brk` then falls back to `mmap`) so `Vec`/`String`/`Box`/`BTreeMap` work. The toolchain proper is `sdk/config.toml` + `sdk/link.ld`, passed to cargo with `--config` from the repo root (one definition, no `.cargo/` per crate). `make disk` discovers `programs/*` and puts each on the disk as `C:/BIN/<NAME>.ELF`. Verified under the kernel: `hello`, `ls` (`read_dir` via `getdents64`), `forkwait` (fork → exec with argv → wait → `ECHILD`), and `heap`, an allocator stress test (100k-element Vec growth, over-aligned boxes, 128 MiB of churn through ~11 MiB of address space, coalescing 4 MiB of small blocks back into a 3 MiB one)
 - [ ] There is no `std` for basicos, and this SDK is deliberately not a stand-in for one. A real `x86_64-unknown-basicos` target with `std` would mean a `library/std/src/sys/basicos` backend (fs, process, time, env, stdio — most of which map onto syscalls the SDK already wraps), a target upstreamed or carried as a rustc fork, and a kernel with what std assumes: threads, a clock (`Instant`/`SystemTime`), `getrandom`, environment variables, and real file metadata. Today's kernel has none of the first four
 - [ ] SDK gaps: single-threaded allocator (no lock — fine while a process has one thread), no environment variables (the kernel ignores `envp`), no time, and `File` buffers whole files in the kernel until `close` (a kernel limitation, documented on the type)
-- [ ] The kernel doesn't launch init itself yet — it still boots straight into the shell task, and `init` is only run by hand (`run C:/init.elf`). Making it PID 1 means `kernel_main` spawning `C:/init.elf` (which needs the ATA disk mounted first, so a fallback if the disk isn't there) and deciding what the shell becomes — probably a process init starts, not a kernel task
-- [ ] init's reaper loop is only exercised on its `-ECHILD` path so far — nothing forks it a child yet, and `spawn_process` sets `ppid: 0` for everything the shell runs, so orphans wouldn't be init's anyway. Real orphan reparenting on `exit()` isn't implemented in `sched`
+- [x] The kernel boots init as pid 1, and init starts the shell (`programs/bash`) on the console and restarts it on logout. Every kernel-shell command is now a program in `C:/BIN/`; `/proc` (`syscall/procfs.rs`) gives them the state only the kernel has. The ring-0 shell stays as an off-by-default debug monitor (`shell` feature). If init exits, the kernel panics; it can't be killed
+- [x] Orphans are reparented to init on exit and kill, and init reaps them (`programs/isotest`)
 
 ## Userland C toolchain (`userland/`)
 
@@ -80,35 +86,71 @@ Both were silent, not crashes — the kind that only show up once something exer
 - [x] initrd/ramdisk support — two flavors now: the read-only initrd (GRUB `module2` FAT32 image, `make initrd`), and a genuinely writable ramdisk (`fs::ramdisk` — a from-scratch FAT32 "mkfs" over a heap-allocated buffer, formatted fresh on every boot)
 - [x] DOS-style drive letters — `A:` the ramdisk, `B:` the initrd, `C:` the main disk (`fs::resolve_path`/`fs::with_drive`), used by the syscall `open()` path and the shell's `ls`/`cat`/`write`/`run`; old no-prefix and `/initrd/...` paths still work, defaulting to `C:`/`B:` respectively
 
+## Syscalls
+
+- [x] Linux-numbered POSIX-ish syscall layer — per-process fd tables (inherited across `fork`, `dup`-shared descriptions, close-on-exec), pipes, `poll`, devices (`/dev/null` etc.), the console as fd 0/1/2 with a cooked-mode stdin, files and directories (`stat`, `mkdir`, `rmdir`, `unlink`, `rename`, `chdir`/`getcwd`, `pread`/`pwrite`, `truncate`, `fsync`, `openat` family), clocks and `nanosleep` (RTC-seeded wall clock), `kill` (fatal signals only), `uname`/`sysinfo`/`getrandom`, and UDP sockets. User pointers are validated (`EFAULT`). The FAT32 crate gained `create_dir`/`remove_dir`/`rename` (host-tested). Verified by `programs/posix` (~100 self-checks, mutation-checked) via `make posix-test`, and by `make net-test` for sockets over the real NIC. Kernel: `kernel/src/syscall/{mod,fd,file,io,sock,misc,console,uaccess}.rs`
+- [x] Every Cargo feature combination builds (`make feature-check`: none, each alone, all-but-one). Fixed: `kernel_main` had no diverging tail without `elf-loader`; the page-fault handler used `format!` (needs the heap); `usermode-demo` now implies `heap`
+- [ ] Signal handlers (`rt_sigaction`/`rt_sigprocmask`/`sigreturn`) — needs a per-process pending mask and a trampoline that runs on the way back to user mode; today `kill` can only terminate
+- [ ] Threads (`clone` with `CLONE_VM`, `futex`, `arch_prctl` for TLS/`%fs`) — a libc port needs these; tasks currently can't share an address space
+- [ ] `select`/`epoll`, and blocking waits that sleep instead of busy-yielding (needs a blocked task state — the same gap as interrupt-driven NIC RX)
+- [ ] File-backed `mmap`; `MAP_FIXED`/address hints for anonymous `mmap`
+- [ ] Open files are buffered whole in memory per *open*: two independent opens of one file don't see each other's writes until close (last close wins), and unlinking a file that's open with unflushed writes recreates it on close. A shared per-file cache keyed by (drive, path) would fix both
+- [ ] Long file names (FAT32 LFN), real timestamps for `stat` (FAT has them; the parser ignores them), permissions/uids
+- [x] Raw sockets — `AF_INET`/`SOCK_RAW` for any IP protocol from 1 to 254, Linux semantics: packets arrive whole (IP header first) as well as being handled by the stack, and you send the payload. No `IP_HDRINCL`, so the source address can't be forged. `ping` is built on them. Tested in `net/src/stack.rs`, `programs/posix` and `make shell-test`
+- [ ] `sendmsg`/`recvmsg`, `socketpair`, `AF_UNIX`
+
 ## Networking
 
 Roughly bottom-up order — each step needs the one before it to test
 against. `fs::BlockDevice` (device-agnostic driver behind a small trait)
 is the template to follow for the NIC layer too.
 
-- [ ] PCI bus enumeration (config space via ports 0xCF8/0xCFC, or MMIO
+**Done so far** (branch `ip-stack`): everything up to and including UDP
+and loopback. The protocol logic is a sans-IO state machine in the `net/`
+crate (`basicos-net`: `Stack` enqueues outgoing frames, callers feed it
+received ones and a clock; 34 host unit tests, run with a bare `cargo
+test`), and the kernel supplies PCI enumeration (`drivers/pci.rs`), a
+polled RTL8139 driver (`drivers/rtl8139.rs`) implementing the `NetDevice`
+trait, and a `net` scheduler task (`net/mod.rs`) that pumps the two
+together, self-tests against the gateway at boot, and runs a UDP echo
+service on port 7. Shell: `ifconfig`, `arp`, `ping <ip> [n]`. Static
+addressing (10.0.2.15/24 via 10.0.2.2, QEMU's user-net defaults) for now.
+Verified against the real driver in QEMU (`make net-test`): gateway ARP +
+ping, and thousands of UDP datagrams (0–1472 bytes) forwarded in from the
+host and echoed back byte-for-byte, with tcpdump finding no bad checksums.
+
+Follow-ups on what's built:
+- [ ] Interrupt-driven RX — the driver runs with IMR=0 and the `net` task
+      spins on `yield_now`, burning a scheduler slot forever; wire the
+      NIC's IRQ line (PCI interrupt line -> PIC) and have the task sleep
+      until it fires (needs a blocked task state, which `sched` lacks)
+- [ ] IP fragmentation/reassembly (fragments are currently dropped) and
+      a real routing table (currently: on-subnet, else the gateway)
+- [ ] ICMP errors beyond port-unreachable (TTL exceeded needs forwarding)
+
+- [x] PCI bus enumeration (config space via ports 0xCF8/0xCFC, or MMIO
       ECAM) — needed just to find a NIC's BARs/IRQ line in the first place
-- [ ] NIC driver — RTL8139 is the classic simple one to start with
+- [x] NIC driver — RTL8139 is the classic simple one to start with
       (QEMU's `-device rtl8139`); e1000 or virtio-net are the more
       "real" alternatives once the stack above it works. RX/TX
       descriptor rings need physically-contiguous DMA buffers —
       `mem::frame::allocate_contiguous` already exists for this
-- [ ] `NetDevice` trait (mirrors `fs::BlockDevice`) so the protocol
+- [x] `NetDevice` trait (mirrors `fs::BlockDevice`) so the protocol
       stack doesn't care which NIC driver is underneath — send/recv a
       raw Ethernet frame, report a MAC address and MTU
-- [ ] Packet buffer management — a pool of fixed-size buffers (or just
+- [x] Packet buffer management — a pool of fixed-size buffers (or just
       `alloc::vec::Vec<u8>` for a first pass) with headroom to prepend
       headers as a packet moves down the stack
-- [ ] Ethernet layer — frame parsing/construction (dst/src MAC,
+- [x] Ethernet layer — frame parsing/construction (dst/src MAC,
       EtherType), dispatch to ARP vs IPv4 by EtherType
-- [ ] ARP — request/reply + a small IP-to-MAC cache; every IPv4 send
+- [x] ARP — request/reply + a small IP-to-MAC cache; every IPv4 send
       needs this before it can address a frame
-- [ ] IPv4 — header parse/build, checksum, a routing table (at minimum
+- [x] IPv4 — header parse/build, checksum, a routing table (at minimum
       "local subnet vs. default gateway"); fine to just drop anything
       that would need fragmentation at first
-- [ ] ICMP echo request/reply — first true end-to-end milestone once
+- [x] ICMP echo request/reply — first true end-to-end milestone once
       Ethernet+ARP+IPv4 exist (answering `ping` from the host)
-- [ ] UDP — simpler than TCP, and DHCP needs it; good next milestone
+- [x] UDP — simpler than TCP, and DHCP needs it; good next milestone
       after ICMP
 - [ ] DHCP client — auto-configure IP/gateway/DNS over UDP instead of
       hardcoding an address
@@ -119,9 +161,9 @@ is the template to follow for the NIC layer too.
       socket/bind/connect/listen/accept/send/recv, reusing the existing
       fd table
 - [ ] DNS stub resolver (A records over UDP) — needs UDP + sockets
-- [ ] Loopback interface (127.0.0.1) — doesn't need a NIC driver at
+- [x] Loopback interface (127.0.0.1) — doesn't need a NIC driver at
       all, good for testing IPv4/UDP/TCP/sockets in isolation early
-- [ ] Gate the whole stack behind a `net` Cargo feature (default-on),
+- [x] Gate the whole stack behind a `net` Cargo feature (default-on),
       following the pattern in `Cargo.toml`'s `[features]` section —
       `storage` is the closest existing example of a multi-piece
       feature with its own dependent syscalls

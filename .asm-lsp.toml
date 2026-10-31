@@ -1,4 +1,4 @@
 [[project]]
 path = "."
-instruction_set = "x86_64"
+instruction_set = "x86-64"
 assembler = "gas"

@@ -22,16 +22,8 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Fat32Error {
-    Io,
-    NotFat32,
-    NotFound,
-    NotAFile,
-    NotADirectory,
-    NoSpace,
-    NameTooLong,
-}
+pub use crate::vfs::FsError as Fat32Error;
+use crate::vfs::{Attr, FileSystem, FsResult};
 
 impl From<BlockError> for Fat32Error {
     fn from(_: BlockError) -> Self {
@@ -155,16 +147,7 @@ const ATTR_VOLUME_ID: u8 = 0x08;
 const ATTR_DIRECTORY: u8 = 0x10;
 const ATTR_LFN: u8 = 0x0F; // READ_ONLY|HIDDEN|SYSTEM|VOLUME_ID all set
 
-/// One 8.3 directory entry.
-#[derive(Debug, Clone)]
-pub struct DirEntry {
-    /// Reconstructed as `"NAME.EXT"` (or `"NAME"` with no extension),
-    /// uppercase — that's what's actually on disk for a short name.
-    pub name: String,
-    pub is_dir: bool,
-    pub size: u32,
-    pub first_cluster: u32,
-}
+pub use crate::vfs::DirEntry;
 
 fn fat_short_name_to_string(name: &[u8], ext: &[u8]) -> String {
     let mut s = String::new();
@@ -375,8 +358,9 @@ impl Fat32Fs {
             entries.push(DirEntry {
                 name,
                 is_dir: attr & ATTR_DIRECTORY != 0,
-                size: le_u32(chunk, 28),
+                size: le_u32(chunk, 28) as u64,
                 first_cluster: (hi << 16) | lo,
+                attr: Attr::default(),
             });
         }
         entries
@@ -457,8 +441,9 @@ impl Fat32Fs {
                     let entry = DirEntry {
                         name: fat_short_name_to_string(&chunk[0..8], &chunk[8..11]),
                         is_dir: chunk[11] & ATTR_DIRECTORY != 0,
-                        size: le_u32(chunk, 28),
+                        size: le_u32(chunk, 28) as u64,
                         first_cluster: (hi << 16) | lo,
+                        attr: Attr::default(),
                     };
                     return Ok(Some((cluster, i * 32, entry)));
                 }
@@ -606,5 +591,302 @@ impl Fat32Fs {
         let mut raw = self.read_cluster(cluster)?;
         raw[offset] = 0xE5;
         self.write_cluster(cluster, &raw)
+    }
+    /// Create an empty directory at `path`. The parent must exist.
+    pub fn create_dir(&mut self, path: &str) -> Result<(), Fat32Error> {
+        let (parent_path, name) = split_path(path);
+        if name.is_empty() {
+            return Err(Fat32Error::AlreadyExists); // the root
+        }
+        let short_name = to_short_name(name)?;
+        let parent = self.resolve_dir(parent_path)?;
+        if self.locate_entry(parent, &short_name)?.is_some() {
+            return Err(Fat32Error::AlreadyExists);
+        }
+
+        // A directory's first cluster starts with "." (itself) and ".."
+        // (its parent; 0 stands for the root) — then zeroes, which read
+        // as "end of directory".
+        let cluster = self.alloc_clusters(1)?[0];
+        let mut buf = vec![0u8; self.layout.cluster_size];
+        let root = self.root_cluster();
+        let parent_ref = if parent == root { 0 } else { parent };
+        Self::write_dot_entry(&mut buf[0..32], b".          ", cluster);
+        Self::write_dot_entry(&mut buf[32..64], b"..         ", parent_ref);
+        self.write_cluster(cluster, &buf)?;
+
+        let (slot_cluster, slot_offset) = self.find_free_slot(parent)?;
+        self.write_entry_slot(slot_cluster, slot_offset, &short_name, true, 0, cluster)
+    }
+
+    fn write_dot_entry(slot: &mut [u8], name: &[u8; 11], cluster: u32) {
+        slot.fill(0);
+        slot[0..11].copy_from_slice(name);
+        slot[11] = ATTR_DIRECTORY;
+        slot[20..22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
+        slot[26..28].copy_from_slice(&((cluster & 0xFFFF) as u16).to_le_bytes());
+    }
+
+    /// Remove the (empty) directory at `path`.
+    pub fn remove_dir(&mut self, path: &str) -> Result<(), Fat32Error> {
+        let (parent_path, name) = split_path(path);
+        if name.is_empty() {
+            return Err(Fat32Error::Invalid); // can't remove the root
+        }
+        let short_name = to_short_name(name)?;
+        let parent = self.resolve_dir(parent_path)?;
+        let (slot_cluster, offset, entry) = self
+            .locate_entry(parent, &short_name)?
+            .ok_or(Fat32Error::NotFound)?;
+        if !entry.is_dir {
+            return Err(Fat32Error::NotADirectory);
+        }
+        if !self.read_dir(entry.first_cluster)?.is_empty() {
+            return Err(Fat32Error::NotEmpty);
+        }
+        self.free_chain(entry.first_cluster)?;
+        let mut raw = self.read_cluster(slot_cluster)?;
+        raw[offset] = 0xE5;
+        self.write_cluster(slot_cluster, &raw)
+    }
+
+    /// Move/rename `from` to `to` (files or directories, across
+    /// directories). An existing *file* at `to` is replaced when `from`
+    /// is a file too, like `rename(2)`; anything else at `to` is
+    /// `AlreadyExists`.
+    pub fn rename(&mut self, from: &str, to: &str) -> Result<(), Fat32Error> {
+        let (from_dir_path, from_name) = split_path(from);
+        let (to_dir_path, to_name) = split_path(to);
+        if from_name.is_empty() || to_name.is_empty() {
+            return Err(Fat32Error::Invalid);
+        }
+        let from_short = to_short_name(from_name)?;
+        let to_short = to_short_name(to_name)?;
+        let from_dir = self.resolve_dir(from_dir_path)?;
+        let (old_cluster, old_offset, entry) = self
+            .locate_entry(from_dir, &from_short)?
+            .ok_or(Fat32Error::NotFound)?;
+
+        let to_dir = self.resolve_dir(to_dir_path)?;
+        if entry.is_dir {
+            // Not into itself or its own subtree.
+            let norm = |p: &str| p.trim_matches('/').to_ascii_uppercase();
+            let (f, t) = (norm(from), norm(to));
+            if t.starts_with(&(f + "/")) {
+                return Err(Fat32Error::Invalid);
+            }
+        }
+        if from_dir == to_dir && from_short == to_short {
+            return Ok(()); // renaming onto itself
+        }
+
+        if let Some((c, o, existing)) = self.locate_entry(to_dir, &to_short)? {
+            if existing.is_dir || entry.is_dir {
+                return Err(Fat32Error::AlreadyExists);
+            }
+            // Replace the old file: free its data and reuse its slot.
+            if existing.first_cluster >= 2 {
+                self.free_chain(existing.first_cluster)?;
+            }
+            let mut raw = self.read_cluster(c)?;
+            raw[o] = 0xE5;
+            self.write_cluster(c, &raw)?;
+        }
+
+        // Link under the new name first, then unlink the old slot, so a
+        // failure in between leaves a duplicate rather than a lost file.
+        let (new_cluster, new_offset) = self.find_free_slot(to_dir)?;
+        self.write_entry_slot(
+            new_cluster,
+            new_offset,
+            &to_short,
+            entry.is_dir,
+            entry.size as u32,
+            entry.first_cluster,
+        )?;
+        // find_free_slot may hand back the very slot we're vacating only
+        // if it was already deleted, which it isn't yet.
+        let mut raw = self.read_cluster(old_cluster)?;
+        raw[old_offset] = 0xE5;
+        self.write_cluster(old_cluster, &raw)?;
+
+        // A moved directory's ".." must point at its new parent.
+        if entry.is_dir && from_dir != to_dir {
+            let root = self.root_cluster();
+            let parent_ref = if to_dir == root { 0 } else { to_dir };
+            let mut dir = self.read_cluster(entry.first_cluster)?;
+            dir[32 + 20..32 + 22].copy_from_slice(&((parent_ref >> 16) as u16).to_le_bytes());
+            dir[32 + 26..32 + 28].copy_from_slice(&((parent_ref & 0xFFFF) as u16).to_le_bytes());
+            self.write_cluster(entry.first_cluster, &dir)?;
+        }
+        Ok(())
+    }
+}
+
+impl FileSystem for Fat32Fs {
+    fn fs_type(&self) -> &'static str {
+        "fat32"
+    }
+
+    fn read_dir_at(&mut self, path: &str) -> FsResult<Vec<DirEntry>> {
+        Fat32Fs::read_dir_at(self, path)
+    }
+
+    fn find(&mut self, path: &str) -> FsResult<DirEntry> {
+        Fat32Fs::find(self, path)
+    }
+
+    fn read_file(&mut self, entry: &DirEntry) -> FsResult<Vec<u8>> {
+        Fat32Fs::read_file(self, entry)
+    }
+
+    fn write_file(&mut self, path: &str, data: &[u8]) -> FsResult<()> {
+        Fat32Fs::write_file(self, path, data)
+    }
+
+    fn delete_file(&mut self, path: &str) -> FsResult<()> {
+        Fat32Fs::delete_file(self, path)
+    }
+
+    fn create_dir(&mut self, path: &str) -> FsResult<()> {
+        Fat32Fs::create_dir(self, path)
+    }
+
+    fn remove_dir(&mut self, path: &str) -> FsResult<()> {
+        Fat32Fs::remove_dir(self, path)
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> FsResult<()> {
+        Fat32Fs::rename(self, from, to)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use super::*;
+    use crate::ramdisk::RamDisk;
+
+    fn fs() -> Fat32Fs {
+        Fat32Fs::mount(Box::new(RamDisk::new())).unwrap()
+    }
+
+    fn names(fs: &mut Fat32Fs, dir: &str) -> Vec<String> {
+        let mut v: Vec<String> = fs.read_dir_at(dir).unwrap().into_iter().map(|e| e.name).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn mkdir_then_files_inside() {
+        let mut fs = fs();
+        fs.create_dir("/docs").unwrap();
+        fs.create_dir("/docs/sub").unwrap();
+        fs.write_file("/docs/sub/a.txt", b"hello").unwrap();
+        assert_eq!(names(&mut fs, "/"), ["DOCS"]);
+        assert_eq!(names(&mut fs, "/docs"), ["SUB"]);
+        assert_eq!(fs.read_file_at("/docs/sub/a.txt").unwrap(), b"hello");
+        assert!(fs.find("/docs").unwrap().is_dir);
+    }
+
+    #[test]
+    fn mkdir_existing_fails_and_missing_parent_fails() {
+        let mut fs = fs();
+        fs.create_dir("/a").unwrap();
+        assert_eq!(fs.create_dir("/a"), Err(Fat32Error::AlreadyExists));
+        assert_eq!(fs.create_dir("/nope/b"), Err(Fat32Error::NotFound));
+        fs.write_file("/f.txt", b"x").unwrap();
+        assert_eq!(fs.create_dir("/f.txt"), Err(Fat32Error::AlreadyExists));
+    }
+
+    #[test]
+    fn dot_entries_are_hidden_but_present_on_disk() {
+        let mut fs = fs();
+        fs.create_dir("/d").unwrap();
+        fs.create_dir("/d/e").unwrap();
+        let d = fs.find("/d").unwrap();
+        let raw = fs.read_cluster(d.first_cluster).unwrap();
+        assert_eq!(&raw[0..2], b". ");
+        assert_eq!(&raw[32..35], b".. ");
+        // ".." of a child of the root is cluster 0; of /d/e it's /d's.
+        assert_eq!(le_u16(&raw, 32 + 26), 0);
+        let e = fs.find("/d/e").unwrap();
+        let eraw = fs.read_cluster(e.first_cluster).unwrap();
+        assert_eq!(le_u16(&eraw, 32 + 26) as u32, d.first_cluster);
+    }
+
+    #[test]
+    fn rmdir_rules() {
+        let mut fs = fs();
+        fs.create_dir("/d").unwrap();
+        fs.write_file("/d/f.txt", b"x").unwrap();
+        assert_eq!(fs.remove_dir("/d"), Err(Fat32Error::NotEmpty));
+        assert_eq!(fs.remove_dir("/d/f.txt"), Err(Fat32Error::NotADirectory));
+        assert_eq!(fs.remove_dir("/"), Err(Fat32Error::Invalid));
+        assert_eq!(fs.remove_dir("/zzz"), Err(Fat32Error::NotFound));
+        fs.delete_file("/d/f.txt").unwrap();
+        fs.remove_dir("/d").unwrap();
+        assert!(names(&mut fs, "/").is_empty());
+    }
+
+    #[test]
+    fn rmdir_frees_its_cluster() {
+        let mut fs = fs();
+        // The ramdisk is tiny; if rmdir leaked, this would run out.
+        for _ in 0..600 {
+            fs.create_dir("/tmp").unwrap();
+            fs.remove_dir("/tmp").unwrap();
+        }
+    }
+
+    #[test]
+    fn rename_file_same_dir_and_across_dirs() {
+        let mut fs = fs();
+        fs.create_dir("/d").unwrap();
+        fs.write_file("/a.txt", b"data").unwrap();
+        fs.rename("/a.txt", "/b.txt").unwrap();
+        assert_eq!(fs.find("/a.txt").unwrap_err(), Fat32Error::NotFound);
+        fs.rename("/b.txt", "/d/c.txt").unwrap();
+        assert_eq!(fs.read_file_at("/d/c.txt").unwrap(), b"data");
+        assert_eq!(names(&mut fs, "/"), ["D"]);
+    }
+
+    #[test]
+    fn rename_replaces_file_but_not_dir() {
+        let mut fs = fs();
+        fs.write_file("/a.txt", b"new").unwrap();
+        fs.write_file("/b.txt", b"old").unwrap();
+        fs.rename("/a.txt", "/b.txt").unwrap();
+        assert_eq!(fs.read_file_at("/b.txt").unwrap(), b"new");
+        assert_eq!(names(&mut fs, "/"), ["B.TXT"]);
+
+        fs.create_dir("/d").unwrap();
+        assert_eq!(fs.rename("/b.txt", "/d"), Err(Fat32Error::AlreadyExists));
+        assert_eq!(fs.rename("/d", "/b.txt"), Err(Fat32Error::AlreadyExists));
+        assert_eq!(fs.rename("/nope", "/x"), Err(Fat32Error::NotFound));
+    }
+
+    #[test]
+    fn rename_dir_updates_dotdot_and_rejects_cycles() {
+        let mut fs = fs();
+        fs.create_dir("/a").unwrap();
+        fs.create_dir("/b").unwrap();
+        fs.write_file("/a/f.txt", b"x").unwrap();
+        fs.rename("/a", "/b/a2").unwrap();
+        assert_eq!(fs.read_file_at("/b/a2/f.txt").unwrap(), b"x");
+        let b = fs.find("/b").unwrap();
+        let a2 = fs.find("/b/a2").unwrap();
+        let raw = fs.read_cluster(a2.first_cluster).unwrap();
+        assert_eq!(le_u16(&raw, 32 + 26) as u32, b.first_cluster);
+        assert_eq!(fs.rename("/b", "/b/a2/inside"), Err(Fat32Error::Invalid));
+        fs.rename("/b", "/b").unwrap(); // onto itself: no-op
+    }
+
+    #[test]
+    fn rename_onto_itself_is_a_noop() {
+        let mut fs = fs();
+        fs.write_file("/a.txt", b"x").unwrap();
+        fs.rename("/a.txt", "/A.TXT").unwrap();
+        assert_eq!(fs.read_file_at("/a.txt").unwrap(), b"x");
     }
 }

@@ -121,11 +121,10 @@ check_long_mode:
 # --- paging / long mode setup ------------------------------------------
 
 setup_page_tables:
-    # NOTE: every entry below is marked user-accessible (bit 2). That's a
-    # bring-up simplification so ring-3 code can run inside the same
-    # identity-mapped 1GiB range as the kernel — there's no real user/kernel
-    # memory isolation yet. Once processes get their own address spaces,
-    # kernel-only pages should go back to supervisor-only.
+    # NOTE: every entry below is marked user-accessible (bit 2), for the
+    # no-scheduler usermode-demo, which runs ring-3 code from the kernel's
+    # own image. Kernels with real processes take that back at boot:
+    # see paging::protect_kernel_mappings.
 
     # p4[0] -> p3_table
     mov $p3_table, %eax

@@ -17,6 +17,13 @@
 #             Also holds the userspace toolchain config — config.toml
 #             (target, build-std, static relocation, linker args) and
 #             link.ld — which the Makefile hands to cargo via --config.
+#   ext4/     the ext4 filesystem (read/write, journal replay) as a
+#             host-testable no_std crate over `basicos-fs`'s BlockDevice —
+#             tested against images made by the real mkfs.ext4/e2fsck.
+#   net/      the IPv4 stack (Ethernet, ARP, IPv4, ICMP, UDP) as a sans-IO
+#             state machine — like fs/, no_std and hardware-free, so it
+#             is unit-tested on the host. The kernel supplies a NIC
+#             driver behind its `NetDevice` trait.
 #   init/     the first userspace program, built on the SDK.
 #   programs/ every other Rust userspace program, one crate each
 #             (`make new-prog NAME=foo` scaffolds one); the "programs/*"
@@ -28,15 +35,15 @@
 # see userland/Makefile and the top-level Makefile for how those build.
 [workspace]
 resolver = "2"
-members = ["kernel", "fs", "init", "sdk", "programs/*"]
-# A bare `cargo build`/`cargo test` at the root only touches `fs`, the one
-# member that's an ordinary host-target crate. `kernel` and `init` both
+members = ["kernel", "fs", "ext4", "net", "init", "sdk", "programs/*"]
+# A bare `cargo build`/`cargo test` at the root only touches `fs` and
+# `net`, the members that are ordinary host-target crates. `kernel` and `init` both
 # need their own target + build-std (kernel/.cargo/config.toml, which
 # only applies with kernel/ as cwd; sdk/config.toml, passed via --config
 # for the userspace crates), so building them from here would try — and
 # fail — to build them for the host. The Makefile's `kernel-bin` and
 # `rust-user` rules are how they get built.
-default-members = ["fs"]
+default-members = ["fs", "ext4", "net"]
 
 # Cargo only honors [profile.*] in the workspace root, not in member
 # manifests — these apply to every member, though only `kernel` (the

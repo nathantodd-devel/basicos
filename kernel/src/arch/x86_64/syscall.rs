@@ -164,14 +164,10 @@ extern "C" fn syscall_entry() {
         // register before overwriting it, so this is safe in this order.
         "push r9",      // arg6 -> stack (7th C-ABI arg)
 
-        // Snapshot RSP now, with the full 10-qword frame
-        // [arg6,r15,r14,r13,r12,rbp,rbx,r11,rcx,user_rsp] sitting right
-        // above it (see `SyscallFrame`) — `fork()` copies this to seed a
-        // child's resume state, `execve()` overwrites rip/user_rsp/rflags
-        // in place to redirect where this syscall returns to. Nothing
-        // below here touches RSP again until the matching pops in
-        // `syscall_return_to_user`.
-        "mov [{frame_ptr}], rsp",
+        // The full 10-qword frame [arg6,r15,r14,r13,r12,rbp,rbx,r11,rcx,
+        // user_rsp] now sits at the very top of this task's kernel stack
+        // (see `SyscallFrame` and `current_frame`). Nothing below here
+        // touches it until the matching pops in `syscall_return_to_user`.
 
         "mov r9, r8",   // arg5 -> r9
         "mov r8, r10",  // arg4 -> r8
@@ -189,12 +185,11 @@ extern "C" fn syscall_entry() {
         // RAX already contains return value from syscall_dispatch.
         // `syscall_return_to_user` (shared with `fork_child_entry`, see
         // its doc comment) does the rest: disable interrupts, pop the
-        // frame `{frame_ptr}` points at, sysretq.
+        // frame, sysretq.
         "jmp {tail}",
 
         user_rsp = sym USER_RSP_SCRATCH,
         stack_top = sym CURRENT_KERNEL_STACK_TOP,
-        frame_ptr = sym CURRENT_SYSCALL_FRAME,
         syscall_dispatch = sym crate::syscall::dispatch,
         tail = sym syscall_return_to_user,
     );
@@ -245,9 +240,8 @@ pub extern "C" fn fork_child_entry() {
 }
 
 /// The syscall-entry register frame `syscall_entry` builds on the kernel
-/// stack before calling `dispatch()` — see the `mov [{frame_ptr}], rsp`
-/// comment there for exactly which instant this is captured at. Field
-/// order matches push order exactly (this is `#[repr(C)]` precisely so
+/// stack before calling `dispatch()`. Field order matches push order
+/// exactly (this is `#[repr(C)]` precisely so
 /// the two stay in sync); `rflags`/`rip` are named for what they hold
 /// (R11/RCX at syscall entry), not the registers themselves.
 #[repr(C)]
@@ -264,39 +258,29 @@ pub struct SyscallFrame {
     pub user_rsp: u64,
 }
 
-/// Set by `syscall_entry` on every syscall; valid only while a syscall
-/// handler is actually running. See `SyscallFrame` and the `mov
-/// [{frame_ptr}], rsp` line above.
-#[no_mangle]
-static mut CURRENT_SYSCALL_FRAME: u64 = 0;
-
-/// The currently in-flight syscall's register frame. `fork()` reads it to
-/// seed a child's resume state; `execve()` overwrites `rip`/`user_rsp`/
-/// `rflags` in place to redirect where this syscall returns to instead of
-/// back into the old program.
+/// The calling task's in-flight syscall register frame. `fork()` reads it
+/// to seed a child's resume state; `execve()` overwrites `rip`/`user_rsp`/
+/// `rflags` in place to redirect where this syscall returns to.
+///
+/// Derived from the running task's own kernel stack rather than recorded
+/// anywhere: `syscall_entry` always starts from the top of that stack, so
+/// the frame is always the top `size_of::<SyscallFrame>()` bytes of it (and
+/// `sched`'s fork support plants a child's copy at the same place). The
+/// scheduler keeps [`CURRENT_KERNEL_STACK_TOP`] pointing at the running
+/// task's stack, so this is right however long the handler has run and
+/// whatever other tasks did in the meantime.
+///
+/// This replaced a global that `syscall_entry` set on every syscall. Any
+/// preemption before the handler read it let another process's syscall
+/// overwrite it, so `execve` (which copies argv in first, plenty of time
+/// for a tick) redirected *that* process to the new image and returned
+/// into the unmapped old one itself. It crashed about one boot in two.
 ///
 /// # Safety
 /// Only valid while called from within a syscall handler (i.e. from code
 /// reachable from `dispatch()`).
-///
-/// **Call this as early as possible in whatever handler needs it, and
-/// hold onto the *pointer*, not a reason to call this again later.** It
-/// reads one global that `syscall_entry` overwrites on every single
-/// syscall, from any task — interrupts are enabled for the whole
-/// dispatch (`syscall_entry`'s own `sti`), so a timer tick can preempt
-/// mid-handler and hand the CPU to a different task, which might make a
-/// syscall of its own before this one resumes. A second call after that
-/// point returns *that* task's frame, not this call's own, with nothing
-/// to indicate anything went wrong — the pointee itself (a fixed spot on
-/// the calling task's own kernel stack) never moves, so capturing the
-/// pointer once, up front, and reusing it is entirely sound; re-deriving
-/// it from this global partway through a long handler is the actual
-/// hazard. `sched::fork_current`/`exec_current` are the two existing
-/// examples — both capture this before doing any of their own
-/// preemptible work (page-table walks, many individual
-/// `frame::allocate()` calls) for exactly this reason.
 pub unsafe fn current_frame() -> *mut SyscallFrame {
-    CURRENT_SYSCALL_FRAME as *mut SyscallFrame
+    (CURRENT_KERNEL_STACK_TOP as usize - core::mem::size_of::<SyscallFrame>()) as *mut SyscallFrame
 }
 
 /// One-slot scratch space for stashing the user's RSP across the stack

@@ -5,6 +5,7 @@
 #   make release      - build optimized, stripped release ISO
 #   make run          - boot debug ISO in QEMU, with the test disk attached
 #   make run-release  - boot release ISO in QEMU, with the test disk attached
+#   make shell-test   - boot headless and test the userspace shell and process isolation
 #   make gdb          - boot debug ISO in QEMU, halted, waiting for GDB on :1234
 #   make disk         - create build/disk.img (2G, FAT32) if it doesn't exist
 #   make disk-reset   - wipe and recreate build/disk.img from scratch
@@ -54,6 +55,7 @@ QEMU        := qemu-system-x86_64
 QEMU_IMG    := qemu-img
 MKFS_VFAT   := mkfs.vfat
 MCOPY       := mcopy
+MMD			:= mmd
 
 # Cargo feature flags, e.g. `--no-default-features --features heap`.
 # Empty (the default) means "use Cargo.toml's default features" — i.e.
@@ -114,16 +116,24 @@ USERLAND_DIR := userland
 # init is special-cased: it goes at the disk root as /init.elf, the path
 # the kernel boots. Names must fit FAT32's 8.3 (8 chars, no long names).
 RUST_USER     := $(CARGO) --config sdk/config.toml -Zjson-target-spec
-RUST_PROGRAMS := $(notdir $(wildcard programs/*))
+# Programs to leave out of the build (e.g. one that's mid-edit and doesn't
+# compile yet): make EXCLUDE_PROGRAMS="bash foo"
+EXCLUDE_PROGRAMS ?=
+RUST_PROGRAMS := $(filter-out $(EXCLUDE_PROGRAMS),$(notdir $(wildcard programs/*)))
 RUST_OUT      := target/$(TARGET_SPEC)/debug
 INIT_ELF      := $(BUILD_DIR)/init.elf
 RUST_ELFS     := $(addprefix $(BUILD_DIR)/bin/,$(addsuffix .elf,$(RUST_PROGRAMS)))
 
 # -boot d: always boot the CD, regardless of the attached hard drive —
 # without it QEMU can try the hard drive first once one is attached.
-QEMU_FLAGS  := -m 256M -serial stdio -boot d -drive file=$(DISK_IMG),format=raw,if=ide,index=0
+# -netdev user: QEMU's built-in NAT'd network (guest 10.0.2.15, gateway
+# 10.0.2.2 — what the kernel's static config assumes); rtl8139 is the NIC
+# the kernel has a driver for.
+NET_TEST_SECONDS ?= 5
+QEMU_FLAGS  := -m 256M -serial stdio -boot d -drive file=$(DISK_IMG),format=raw,if=ide,index=0 \
+               -netdev user,id=n0 -device rtl8139,netdev=n0
 
-.PHONY: all debug release kernel-bin kernel-release iso iso-release run run-release gdb \
+.PHONY: all debug release kernel-bin kernel-release iso iso-release run run-release gdb net-test posix-test shell-test ext4-test feature-check \
         disk disk-reset initrd initrd-reset reset-disks testprog forktest userland init-elf rust-programs new-prog \
         clean size FORCE
 
@@ -161,7 +171,7 @@ $(DEBUG_LIB): $(RUST_SOURCES) kernel/Cargo.toml fs/Cargo.toml kernel/$(TARGET_SP
 # .PHONY targets bypass the filesystem check regardless of what's on
 # disk with the same name, but confusing to read).
 kernel-bin: $(ASM_OBJ) $(DEBUG_LIB) kernel/linker.ld
-	$(LD) -n -T kernel/linker.ld -o $(DEBUG_BIN) $(ASM_OBJ) $(DEBUG_LIB)
+	$(LD) -n --gc-sections -T kernel/linker.ld -o $(DEBUG_BIN) $(ASM_OBJ) $(DEBUG_LIB)
 
 iso: kernel-bin initrd
 	mkdir -p $(ISO_DIR)/boot/grub
@@ -178,7 +188,7 @@ $(RELEASE_LIB): $(RUST_SOURCES) kernel/Cargo.toml fs/Cargo.toml kernel/$(TARGET_
 	cd kernel && $(CARGO) -Zjson-target-spec build --release $(FEATURES)
 
 kernel-release: $(ASM_OBJ) $(RELEASE_LIB) kernel/linker.ld
-	$(LD) -n -T kernel/linker.ld -o $(RELEASE_BIN) $(ASM_OBJ) $(RELEASE_LIB)
+	$(LD) -n --gc-sections -T kernel/linker.ld -o $(RELEASE_BIN) $(ASM_OBJ) $(RELEASE_LIB)
 	# Strip all symbols except those needed for multiboot
 	$(STRIP) --strip-all $(RELEASE_BIN)
 	# Alternative: keep only essential symbols
@@ -206,14 +216,14 @@ $(DISK_IMG): $(TESTPROG_ELF) $(FORKTEST_ELF) $(INIT_ELF) $(RUST_ELFS) userland
 	$(QEMU_IMG) create -f raw $(DISK_IMG) $(DISK_SIZE)
 	$(MKFS_VFAT) -F 32 -n BASICOS $(DISK_IMG)
 	echo "hello from the FAT32 test disk" | $(MCOPY) -i $(DISK_IMG) - ::/hello.txt
-	mmd -i $(DISK_IMG) ::/docs
+	$(MMD) -i $(DISK_IMG) ::/docs
 	echo "just some docs on the test disk" | $(MCOPY) -i $(DISK_IMG) - ::/docs/readme.txt
 	$(MCOPY) -i $(DISK_IMG) $(TESTPROG_ELF) ::/hello.elf
 	$(MCOPY) -i $(DISK_IMG) $(FORKTEST_ELF) ::/forktest.elf
 	$(MCOPY) -i $(DISK_IMG) $(INIT_ELF) ::/init.elf
-	mmd -i $(DISK_IMG) ::/BIN
+	$(MMD) -i $(DISK_IMG) ::/BIN
 	$(MCOPY) -i $(DISK_IMG) $(RUST_ELFS) ::/BIN/
-	mmd -i $(DISK_IMG) ::/TESTPROG
+	$(MMD) -i $(DISK_IMG) ::/TESTPROG
 	$(MCOPY) -i $(DISK_IMG) $(USERLAND_DIR)/build/*.elf ::/TESTPROG/
 
 disk: $(DISK_IMG)
@@ -270,7 +280,7 @@ new-prog:
 	mkdir -p programs/$(NAME)/src
 	printf '[package]\nname = "$(NAME)"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\nbasicos-sdk = { path = "../../sdk" }\n' > programs/$(NAME)/Cargo.toml
 	printf '#![no_std]\n#![no_main]\n\nuse basicos_sdk::prelude::*;\n\nbasicos_sdk::entry!(main);\n\nfn main(_args: Args) {\n    println!("$(NAME): hello!");\n}\n' > programs/$(NAME)/src/main.rs
-	@echo "created programs/$(NAME) — build with 'make disk', run it with 'run C:/BIN/$(shell echo $(NAME) | tr a-z A-Z).ELF'"
+	@echo "created programs/$(NAME) — build with 'make disk', run it from the shell with '$(NAME)'"
 
 # userland/: C programs against syscalls.h — see userland/Makefile for
 # the actual build rules (compiler flags, crt0, linker script) and the
@@ -307,6 +317,35 @@ reset-disks: disk-reset initrd-reset
 
 run: iso disk
 	$(QEMU) -cdrom $(DEBUG_ISO) $(QEMU_FLAGS)
+
+# Build the kernel under a matrix of Cargo feature sets (tools/feature-check.sh).
+feature-check:
+	tools/feature-check.sh
+
+# Boot headless and run the programs/posix syscall self-test through the
+# shell (tools/posix-test.py). Needs python3 + qemu.
+posix-test: iso disk
+	python3 tools/posix-test.py $(DEBUG_ISO) $(DISK_IMG)
+
+# Boot headless and drive the userspace shell: every command, a crashing
+# program, attempts to reach kernel memory, repeated fork/exec, and logging
+# out (tools/shell-test.py). Needs python3 + qemu.
+shell-test: iso disk
+	python3 tools/shell-test.py $(DEBUG_ISO) $(DISK_IMG)
+
+# Boot headless with real ext4 volumes (whole-disk with a dirty journal,
+# MBR- and GPT-partitioned) attached beside the FAT32 disk, and check
+# mounting, journal replay, reads/writes and the syscall suite on them,
+# then run e2fsck on the results (tools/ext4-test.py). Needs the e2fsprogs
+# tools (mkfs.ext4, e2fsck, debugfs) and sfdisk.
+ext4-test: iso disk
+	python3 tools/ext4-test.py $(DEBUG_ISO) $(DISK_IMG)
+
+# Boot headless and exercise the real NIC + stack: gateway ping and UDP
+# echo soaks from the host, against both the in-kernel echo service and a
+# ring-3 program through the socket syscalls (tools/net-test.py).
+net-test: iso disk
+	python3 tools/net-test.py $(DEBUG_ISO) $(DISK_IMG) $(NET_TEST_SECONDS)
 
 run-release: iso-release disk
 	$(QEMU) -cdrom $(RELEASE_ISO) $(QEMU_FLAGS)

@@ -581,42 +581,6 @@ impl PageMapper {
         }
     }
 
-    /// Unmap and free every currently-present page inside the process
-    /// zone, keeping the address space's own P1/P2/P3/P4 structure
-    /// intact (just emptied) so it can be reused immediately — what
-    /// `execve()` uses to tear down a process's old image before loading
-    /// a new one into the same address space.
-    ///
-    /// # Safety
-    /// Must not be called while any of the unmapped pages are still in
-    /// use (e.g. by another task sharing this address space — this
-    /// kernel doesn't have those, but if it ever does, this needs to
-    /// change).
-    pub unsafe fn unmap_zone(&mut self) {
-        let start_idx = VirtualAddress::new(PROC_ZONE_START as u64).p2_index();
-        let end_idx = VirtualAddress::new((PROC_ZONE_END - PAGE_SIZE) as u64).p2_index();
-
-        let p4 = &*(self.p4_physical as *const PageTable);
-        let p3 = &*(p4.entry(0).address() as *const PageTable);
-        let p2 = &*(p3.entry(0).address() as *const PageTable);
-
-        for idx in start_idx..=end_idx {
-            let entry = p2.entry(idx);
-            if !entry.is_present() {
-                continue;
-            }
-            let p1 = &mut *(entry.address() as *mut PageTable);
-            for i in 0..ENTRIES_PER_TABLE {
-                let e = p1.entry_mut(i);
-                if e.is_present() {
-                    deallocate(e.frame());
-                    e.clear();
-                }
-            }
-        }
-        flush_tlb_all();
-    }
-
     /// Free every frame this address space owns exclusively: its own
     /// process-zone data pages and P1 tables, and its own P4/P3/P2. Does
     /// *not* touch anything outside the zone — that's the shared kernel
@@ -624,15 +588,10 @@ impl PageMapper {
     ///
     /// # Safety
     /// Nothing may access any address inside this address space's
-    /// process zone after this returns. It *is* fine to call this while
-    /// `self` is still the address space loaded in CR3 (`exit_process`
-    /// does exactly that) — every frame this frees comes from outside
-    /// the zone's own reserved physical range or is a table these raw
-    /// physical dereferences don't need CR3 for in the first place, and
-    /// nothing kernel-side ever touches the zone, so a CR3 that's
-    /// nominally "stale" for one more scheduler tick is harmless (see
-    /// `sched`'s module docs on why CR3 can lag briefly between
-    /// switches).
+    /// process zone after this returns, and it must not be the address
+    /// space loaded in CR3: its tables are freed here, and can be handed to
+    /// someone else at any moment after that. `exit_process` and
+    /// `exec_current` both move to other tables first.
     pub unsafe fn destroy(self) {
         let start_idx = VirtualAddress::new(PROC_ZONE_START as u64).p2_index();
         let end_idx = VirtualAddress::new((PROC_ZONE_END - PAGE_SIZE) as u64).p2_index();
@@ -693,6 +652,46 @@ pub fn demote_process_zone() {
             }
             entry.set(p1_frame, flags::USER_PAGE);
         }
+    }
+    drop(guard);
+    flush_tlb_all();
+}
+
+/// Close the kernel off from ring 3. `entrypoint.s` has to mark the whole
+/// identity map user-accessible to get anything running; this clears that on
+/// everything outside the process zone, so user code can only touch its own
+/// pages, and every later address space inherits the result (they all copy
+/// these tables). Page 0 is also unmapped outright, so a NULL dereference
+/// faults in ring 0 as well instead of reading the BIOS's interrupt table.
+///
+/// Call once, after `demote_process_zone` and before any address space is
+/// created. Only for kernels with real processes: the no-scheduler
+/// `usermode-demo` runs ring-3 code from the kernel's own image.
+pub fn protect_kernel_mappings() {
+    let mut guard = PAGE_MAPPER.lock();
+    let mapper = guard.as_mut().expect("paging not initialized");
+    unsafe {
+        let p4 = &*(mapper.p4_physical as *const PageTable);
+        let p3 = &*(p4.entry(0).address() as *const PageTable);
+        let p2 = &mut *(p3.entry(0).address() as *mut PageTable);
+
+        for idx in 0..ENTRIES_PER_TABLE {
+            let entry = p2.entry_mut(idx);
+            if entry.is_present() {
+                let (frame, f) = (entry.frame(), entry.flags());
+                entry.set(frame, f & !flags::USER_ACCESSIBLE);
+            }
+        }
+
+        // Split the first 2 MiB so page 0 alone can go.
+        let p1_frame = allocate().expect("out of frames unmapping page 0");
+        let p1 = &mut *(p1_frame.start_address() as *mut PageTable);
+        p1.zero();
+        for i in 1..ENTRIES_PER_TABLE {
+            p1.entry_mut(i)
+                .set(Frame::containing_address(i * PAGE_SIZE), flags::KERNEL_PAGE);
+        }
+        p2.entry_mut(0).set(p1_frame, flags::KERNEL_PAGE);
     }
     drop(guard);
     flush_tlb_all();

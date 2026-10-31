@@ -77,3 +77,46 @@ pub fn exec(path: &str, args: &[&str]) -> Errno {
     };
     Errno(if r < 0 { -r as i32 } else { 0 })
 }
+
+/// The parent's pid (0 if it has none, e.g. `init`'s launcher).
+pub fn getppid() -> Pid {
+    unsafe { sys::syscall0(nr::GETPPID) as Pid }
+}
+
+pub const SIGHUP: usize = 1;
+pub const SIGINT: usize = 2;
+pub const SIGKILL: usize = 9;
+pub const SIGTERM: usize = 15;
+
+/// Send a signal. There are no handlers: fatal signals terminate the
+/// target (its exit status becomes `128 + sig`), ignorable ones
+/// (`SIGCHLD`, `SIGCONT`, ...) are dropped, and signal 0 just checks
+/// that the process exists.
+pub fn kill(pid: Pid, sig: usize) -> Result<()> {
+    check(unsafe { sys::syscall2(nr::KILL, pid, sig) }).map(|_| ())
+}
+
+/// `uname`: system name and version strings.
+#[derive(Debug, Clone)]
+pub struct Uname {
+    pub sysname: alloc::string::String,
+    pub release: alloc::string::String,
+    pub machine: alloc::string::String,
+}
+
+pub fn uname() -> Result<Uname> {
+    let mut b = [0u8; 65 * 6];
+    check(unsafe { sys::syscall1(nr::UNAME, b.as_mut_ptr() as usize) })?;
+    let field = |i: usize| {
+        let f = &b[i * 65..(i + 1) * 65];
+        let end = f.iter().position(|&c| c == 0).unwrap_or(f.len());
+        alloc::string::String::from_utf8_lossy(&f[..end]).into_owned()
+    };
+    Ok(Uname { sysname: field(0), release: field(2), machine: field(4) })
+}
+
+/// Fill `buf` with pseudo-random bytes (xorshift seeded from the TSC —
+/// fine for jitter and test data, **not** for cryptography).
+pub fn getrandom(buf: &mut [u8]) -> Result<()> {
+    check(unsafe { sys::syscall3(nr::GETRANDOM, buf.as_mut_ptr() as usize, buf.len(), 0) }).map(|_| ())
+}

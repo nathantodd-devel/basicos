@@ -98,7 +98,7 @@ use core::sync::atomic::AtomicU64;
 mod demo;
 
 /// Fixed task-table size — no dynamic task creation beyond this.
-pub const MAX_TASKS: usize = 8;
+pub const MAX_TASKS: usize = 32;
 
 /// Kernel stack given to each task. Plenty for the kinds of things a
 /// ring-0 thread does here (no deep recursion, no large stack arrays) —
@@ -265,7 +265,7 @@ unsafe fn plant_initial_frame(idx: usize, entry: u64, extra: &[u64]) -> u64 {
 /// Returns `None` if the task table is full.
 pub fn spawn(name: &'static str, entry: extern "C" fn() -> !) -> Option<usize> {
     unsafe {
-        let idx = (0..MAX_TASKS).find(|&i| TASKS[i].state == TaskState::Unused)?;
+        let idx = claim_slot()?;
         let rsp = plant_initial_frame(idx, entry as u64, &[]);
         TASKS[idx] = TaskSlot {
             state: TaskState::Ready,
@@ -274,6 +274,21 @@ pub fn spawn(name: &'static str, entry: extern "C" fn() -> !) -> Option<usize> {
         };
         Some(idx)
     }
+}
+
+/// Atomically take an unused task slot. It's marked `Done` — held, but
+/// neither schedulable nor reapable — until the caller finishes filling it
+/// in, which for `fork` and `spawn_process` is long, preemptible work. Two
+/// callers that only *looked* for a free slot could both pick the same one.
+fn claim_slot() -> Option<usize> {
+    let was_enabled = interrupts::disable();
+    // Safety: interrupts are off, so nothing else touches `TASKS`.
+    let idx = unsafe { (0..MAX_TASKS).find(|&i| TASKS[i].state == TaskState::Unused) };
+    if let Some(i) = idx {
+        unsafe { TASKS[i].state = TaskState::Done };
+    }
+    interrupts::restore(was_enabled);
+    idx
 }
 
 fn pick_next() -> Option<usize> {
@@ -357,12 +372,28 @@ pub fn yield_now() {
     if current == NONE_RUNNING {
         return;
     }
+    // Interrupts stay off from before the state change until the switch
+    // comes back. A tick in between would run a nested `yield_now`; the
+    // outer call would then switch away a second time still marked
+    // `Running`, which `pick_next` never picks, so the task would be lost.
+    let was_enabled = interrupts::disable();
     unsafe {
         if TASKS[current].state == TaskState::Running {
             TASKS[current].state = TaskState::Ready;
         }
         switch(core::ptr::addr_of_mut!(TASKS[current].rsp), SCHED_RSP);
-        // Resumes here once `run()` schedules this task again.
+    }
+    interrupts::restore(was_enabled);
+}
+
+/// Index of the calling task's slot (0 when nothing is running, e.g. the
+/// one-shot ring-3 demo boots with no scheduler task at all). Per-task
+/// state kept outside the scheduler — the syscall layer's fd tables —
+/// is keyed by this.
+pub fn current_index() -> usize {
+    match CURRENT.load(Ordering::Relaxed) {
+        NONE_RUNNING => 0,
+        idx => idx,
     }
 }
 
@@ -435,6 +466,27 @@ mod process {
         /// (the ramdisk's non-coalescing allocator is the same idea).
         pub mmap_next: u64,
         pub exit_status: i32,
+        /// The program's file name, NUL-padded — what `ps` shows.
+        pub name: [u8; 16],
+    }
+
+    /// The last path component, truncated to fit [`ProcessInfo::name`].
+    fn name_from_path(path: &str) -> [u8; 16] {
+        let base = path.rsplit('/').next().unwrap_or(path).as_bytes();
+        let mut name = [0u8; 16];
+        let n = base.len().min(name.len());
+        name[..n].copy_from_slice(&base[..n]);
+        name
+    }
+
+    /// `ppid` of every child of `pid` becomes 1: init adopts orphans, and
+    /// its reaper loop collects them. Call with interrupts off.
+    unsafe fn reparent_children(pid: u64) {
+        for i in 0..MAX_TASKS {
+            if PROC_INFO[i].pid != 0 && PROC_INFO[i].ppid == pid {
+                PROC_INFO[i].ppid = 1;
+            }
+        }
     }
 
     impl ProcessInfo {
@@ -448,6 +500,7 @@ mod process {
                 brk: 0,
                 mmap_next: 0,
                 exit_status: 0,
+                name: [0; 16],
             }
         }
     }
@@ -559,6 +612,15 @@ mod process {
     /// — it's a real scheduler task now, so the caller (the shell) keeps
     /// running concurrently with it.
     pub fn spawn_process(name: &'static str, path: &str) -> Result<u64, crate::elf::RunError> {
+        spawn_process_args(name, path, &[])
+    }
+
+    /// [`spawn_process`] with extra arguments: `argv` is `[path, args...]`.
+    pub fn spawn_process_args(
+        name: &'static str,
+        path: &str,
+        args: &[&str],
+    ) -> Result<u64, crate::elf::RunError> {
         let (drive, rest) = crate::fs::resolve_path(path);
         let data = match crate::fs::with_drive(drive, |vol| vol.read_file_at(rest)) {
             Some(Ok(data)) => data,
@@ -566,27 +628,42 @@ mod process {
             None => return Err(crate::elf::RunError::NotFound),
         };
 
-        let idx = unsafe { (0..MAX_TASKS).find(|&i| TASKS[i].state == TaskState::Unused) }
-            .ok_or(crate::elf::RunError::NoTaskSlots)?;
+        let idx = claim_slot().ok_or(crate::elf::RunError::NoTaskSlots)?;
 
         let mut space = PageMapper::new_process_space();
-        let entry =
-            unsafe { crate::elf::load_into(&mut space, &data) }.map_err(crate::elf::RunError::Elf)?;
-        let stack_top = unsafe { setup_stack(&mut space, &[path]) };
+        let entry = match unsafe { crate::elf::load_into(&mut space, &data) } {
+            Ok(entry) => entry,
+            Err(e) => {
+                unsafe {
+                    space.destroy();
+                    TASKS[idx].state = TaskState::Unused;
+                }
+                return Err(crate::elf::RunError::Elf(e));
+            }
+        };
+        let mut argv: Vec<&str> = Vec::with_capacity(args.len() + 1);
+        argv.push(path);
+        argv.extend_from_slice(args);
+        let stack_top = unsafe { setup_stack(&mut space, &argv) };
 
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
         unsafe {
             PROC_INFO[idx] = ProcessInfo {
                 pid,
-                ppid: 0,
+                // Anything the kernel starts directly is init's child, so
+                // init reaps it; init itself has no parent.
+                ppid: if pid == 1 { 0 } else { 1 },
                 cr3: space.cr3(),
                 entry_point: entry,
                 user_stack_top: stack_top,
                 brk: PROC_HEAP_START as u64,
                 mmap_next: PROC_MMAP_START as u64,
                 exit_status: 0,
+                name: name_from_path(path),
             };
             let rsp = plant_initial_frame(idx, ring3_task_entry as *const () as u64, &[]);
+            // A fresh process: stdin/stdout/stderr on the console, root cwd.
+            crate::syscall::fd::reset_slot(idx);
             TASKS[idx] = TaskSlot {
                 state: TaskState::Ready,
                 rsp,
@@ -606,18 +683,10 @@ mod process {
     ///
     /// Returns `None` if the task table is full.
     pub fn fork_current() -> Option<u64> {
-        // Same reasoning as `exec_current`'s own doc comment: capture
-        // this call's syscall frame *before* `fork_from`'s deep copy (a
-        // lot of individually-brief-but-cumulatively-lengthy, fully
-        // preemptible `frame::allocate()` calls) gives a timer tick the
-        // chance to switch to some other task that makes a syscall of
-        // its own — which would silently overwrite the single global
-        // `current_frame()` reads from, with no reason to expect anyone
-        // reading it late would notice it now points somewhere else.
         let frame = unsafe { &*arch_syscall::current_frame() };
 
         let parent_idx = CURRENT.load(Ordering::Relaxed);
-        let child_idx = unsafe { (0..MAX_TASKS).find(|&i| TASKS[i].state == TaskState::Unused) }?;
+        let child_idx = claim_slot()?;
 
         let parent_cr3 = unsafe { PROC_INFO[parent_idx].cr3 };
         let parent_space = PageMapper::for_address_space(parent_cr3);
@@ -636,6 +705,7 @@ mod process {
                 brk: parent.brk,
                 mmap_next: parent.mmap_next,
                 exit_status: 0,
+                name: parent.name,
             };
 
             // Plant the child's stack: `switch()` rets into
@@ -659,6 +729,9 @@ mod process {
                 arch_syscall::fork_child_entry as *const () as u64,
                 &saved,
             );
+            // The child shares the parent's open files (same descriptions
+            // — offsets, pipes — just separate descriptor tables).
+            crate::syscall::fd::on_fork(parent_idx, child_idx);
             TASKS[child_idx] = TaskSlot {
                 state: TaskState::Ready,
                 rsp,
@@ -668,35 +741,19 @@ mod process {
         Some(child_pid)
     }
 
-    /// `execve()`: tear down the calling process's *own* memory (code,
-    /// heap, mmap'd pages, stack — everything in the process zone) and
-    /// replace it with a freshly loaded ELF, redirecting the in-flight
-    /// syscall to return into the new program instead of the old one.
-    /// Same pid, same task slot, same parent — just a new image, exactly
-    /// like the real thing.
+    /// `execve()`: replace the calling process's image with a freshly
+    /// loaded ELF, redirecting the in-flight syscall to return into the new
+    /// program. Same pid, task slot and parent — just a new image.
+    ///
+    /// The new image is built in a separate address space and swapped in
+    /// only once it's complete, so a failed exec (a bad ELF, say) returns
+    /// an error to a process that's still fully intact.
     ///
     /// On success this doesn't "return" in any meaningful sense (the
     /// calling program is gone), but the Rust call itself does — the
     /// redirection happens by mutating the current `SyscallFrame` in
     /// place, which `syscall_return_to_user` picks up normally.
     pub fn exec_current(path: &str, argv: &[&str]) -> Result<(), crate::elf::RunError> {
-        // Capture *this* call's own syscall frame right away, before
-        // `load_into`/`setup_stack` below do a lot of preemptible work
-        // (many individual `frame::allocate()` calls, each a brief
-        // critical section but with interrupts back on in between).
-        // `arch_syscall::current_frame()` reads a single global that
-        // `syscall_entry` overwrites on *every* syscall, from *any*
-        // task — if a timer tick preempted this task mid-`load_into` and
-        // some other task made a syscall of its own before this one
-        // resumed, a late read here would silently pick up that other
-        // task's frame pointer instead of this call's own, and the
-        // writes below would corrupt an unrelated process's return
-        // state. Capturing the pointer now and reusing it, rather than
-        // re-deriving it from the global later, sidesteps that
-        // entirely — the pointee (a fixed spot on *this* task's own
-        // kernel stack) doesn't move, only the global's current value is
-        // unstable. `fork_current` already does the same thing for the
-        // same reason.
         let frame = unsafe { arch_syscall::current_frame() };
 
         let (drive, rest) = crate::fs::resolve_path(path);
@@ -706,21 +763,31 @@ mod process {
             None => return Err(crate::elf::RunError::NotFound),
         };
 
-        let idx = CURRENT.load(Ordering::Relaxed);
-        let cr3 = unsafe { PROC_INFO[idx].cr3 };
-        let mut space = PageMapper::for_address_space(cr3);
-
-        // Tear down the old image entirely before loading the new one —
-        // `execve` fully replaces the process, no leftover mappings.
-        unsafe { space.unmap_zone() };
-
-        let entry =
-            unsafe { crate::elf::load_into(&mut space, &data) }.map_err(crate::elf::RunError::Elf)?;
+        let mut space = PageMapper::new_process_space();
+        let entry = match unsafe { crate::elf::load_into(&mut space, &data) } {
+            Ok(entry) => entry,
+            Err(e) => {
+                unsafe { space.destroy() };
+                return Err(crate::elf::RunError::Elf(e));
+            }
+        };
         let stack_top = unsafe { setup_stack(&mut space, argv) };
 
+        let idx = CURRENT.load(Ordering::Relaxed);
         unsafe {
+            // CR3 and the record of it must change together: a tick between
+            // them would have the scheduler reload the old tables.
+            let was_enabled = interrupts::disable();
+            let old_cr3 = PROC_INFO[idx].cr3;
+            PROC_INFO[idx].cr3 = space.cr3();
+            paging::write_cr3(space.cr3());
+            interrupts::restore(was_enabled);
+            PageMapper::for_address_space(old_cr3).destroy();
+
             PROC_INFO[idx].brk = PROC_HEAP_START as u64;
             PROC_INFO[idx].mmap_next = PROC_MMAP_START as u64;
+            PROC_INFO[idx].name = name_from_path(path);
+            crate::syscall::fd::on_exec(idx);
 
             (*frame).rip = entry;
             (*frame).user_rsp = stack_top;
@@ -739,14 +806,110 @@ mod process {
     pub fn exit_process(status: i32) -> ! {
         let idx = CURRENT.load(Ordering::Relaxed);
         assert_ne!(idx, NONE_RUNNING, "exit_process() outside a task");
+        if unsafe { PROC_INFO[idx].pid } == 1 {
+            panic!("init exited with status {}", status);
+        }
+        // Close every open file first: flushes dirty files to disk, and
+        // tells the other end of any pipe/socket we held that we're gone.
+        crate::syscall::fd::on_exit(idx);
         unsafe {
+            // From here until the switch nothing may interrupt us: the
+            // process's page tables are about to be freed, so leave them
+            // first, and a tick mustn't reload a CR3 whose frames may
+            // already belong to someone else.
+            interrupts::disable();
             let cr3 = PROC_INFO[idx].cr3;
+            paging::write_cr3(paging::boot_cr3());
             PageMapper::for_address_space(cr3).destroy();
+            reparent_children(PROC_INFO[idx].pid);
             PROC_INFO[idx].exit_status = status;
             TASKS[idx].state = TaskState::Zombie;
             switch(core::ptr::addr_of_mut!(TASKS[idx].rsp), SCHED_RSP);
         }
         unreachable!("a Zombie task is never scheduled again");
+    }
+
+    /// Terminate process `pid` as if it had called `exit(status)` (what
+    /// `kill` does for the fatal signals — there are no user signal
+    /// handlers, so the default action is all there is). Killing yourself
+    /// is just `exit_process`. `Err` if there's no such live process.
+    ///
+    /// The victim can't be on the CPU (single core, and we are), so its
+    /// slot can be torn down directly. It's parked as `Done` meanwhile:
+    /// unschedulable, but not yet a `Zombie` a waiting parent could reap
+    /// out from under this teardown. init can't be killed (`Err`).
+    pub fn kill_process(pid: u64, status: i32) -> Result<(), ()> {
+        if pid == 1 {
+            return Err(());
+        }
+        let me = CURRENT.load(Ordering::Relaxed);
+        let was_enabled = interrupts::disable();
+        let found = unsafe {
+            (0..MAX_TASKS).find(|&i| {
+                PROC_INFO[i].pid == pid
+                    && matches!(TASKS[i].state, TaskState::Ready | TaskState::Running)
+            })
+        };
+        if let Some(idx) = found.filter(|&idx| idx != me) {
+            unsafe { TASKS[idx].state = TaskState::Done };
+        }
+        interrupts::restore(was_enabled);
+
+        let idx = found.ok_or(())?;
+        if idx == me {
+            exit_process(status);
+        }
+        unsafe {
+            crate::syscall::fd::on_exit(idx);
+            PageMapper::for_address_space(PROC_INFO[idx].cr3).destroy();
+            let was_enabled = interrupts::disable();
+            reparent_children(pid);
+            PROC_INFO[idx].exit_status = status;
+            TASKS[idx].state = TaskState::Zombie;
+            interrupts::restore(was_enabled);
+        }
+        Ok(())
+    }
+
+    /// Whether `pid` names a process that exists (running or a zombie not
+    /// yet reaped) — `kill(pid, 0)`.
+    pub fn process_exists(pid: u64) -> bool {
+        pid != 0 && unsafe { (0..MAX_TASKS).any(|i| PROC_INFO[i].pid == pid) }
+    }
+
+    /// Number of processes (running or zombie).
+    pub fn process_count() -> usize {
+        unsafe { (0..MAX_TASKS).filter(|&i| PROC_INFO[i].pid != 0).count() }
+    }
+
+    /// Snapshot every task for `/proc/tasks`: `f` gets `(pid, ppid, name,
+    /// state)`, with pid 0 for a plain kernel thread.
+    pub fn for_each_process(mut f: impl FnMut(u64, u64, &str, TaskState)) {
+        let was_enabled = interrupts::disable();
+        for i in 0..MAX_TASKS {
+            // Safety: interrupts are off, so nothing else touches the tables.
+            let (state, task_name, p) = unsafe { (TASKS[i].state, TASKS[i].name, PROC_INFO[i]) };
+            if state == TaskState::Unused {
+                continue;
+            }
+            let len = p.name.iter().position(|&b| b == 0).unwrap_or(p.name.len());
+            let name = if p.pid == 0 {
+                task_name
+            } else {
+                core::str::from_utf8(&p.name[..len]).unwrap_or("?")
+            };
+            f(p.pid, p.ppid, name, state);
+        }
+        interrupts::restore(was_enabled);
+    }
+
+    /// The calling process's parent pid (0 if it has none).
+    pub fn current_ppid() -> u64 {
+        let idx = CURRENT.load(Ordering::Relaxed);
+        if idx == NONE_RUNNING {
+            return 0;
+        }
+        unsafe { PROC_INFO[idx].ppid }
     }
 
     /// `wait`/`waitpid`: block (via a plain yield loop — no dedicated
@@ -761,6 +924,7 @@ mod process {
         loop {
             let mut saw_any = false;
             let mut reaped = None;
+            let was_enabled = interrupts::disable();
             unsafe {
                 for i in 0..MAX_TASKS {
                     if PROC_INFO[i].pid == 0 || PROC_INFO[i].ppid != caller_pid {
@@ -780,6 +944,7 @@ mod process {
                     }
                 }
             }
+            interrupts::restore(was_enabled);
             if let Some(result) = reaped {
                 return Some(result);
             }
@@ -899,6 +1064,8 @@ mod process {
 
 #[cfg(feature = "elf-loader")]
 pub use process::{
-    current_pid, exec_current, exit_process, fork_current, proc_brk, proc_mmap, proc_munmap,
-    spawn_process, wait_for_child, PROC_INFO,
+    current_pid, current_ppid, exec_current, exit_process, for_each_process, fork_current,
+    kill_process,
+    proc_brk, proc_mmap, proc_munmap, process_count, process_exists, spawn_process,
+    spawn_process_args, wait_for_child, PROC_INFO,
 };

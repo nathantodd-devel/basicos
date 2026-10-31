@@ -1,5 +1,7 @@
-//! init — the first userspace program, meant to run as a long-lived
-//! process that reaps orphaned children.
+//! init — the first userspace program, pid 1. It starts the shell on the
+//! console, starts a new one whenever that exits, and reaps every orphan the
+//! kernel hands it. If init ever exits the kernel panics, so nothing here
+//! returns.
 //!
 //! A `#![no_std]` Rust program built on `basicos-sdk` (see `sdk/`): the
 //! SDK supplies the `_start` shim, syscalls, and panic handler, and the
@@ -11,29 +13,53 @@
 
 use basicos_sdk::prelude::*;
 
-use basicos_sdk::process::Fork::{Child, Parent};
-use basicos_sdk::process::{Fork, fork};
+use core::time::Duration;
+use process::{Fork, Pid};
 
 basicos_sdk::entry!(main);
 
-fn main(args: Args) -> i32 {
-    // init process
-    println!(
-        "init: started as pid {} (argc={})",
-        process::getpid(),
-        args.len()
-    );
-    for (i, a) in args.iter().enumerate() {
-        println!("init: argv[{}] = {}", i, a);
-    }
+const SHELL: &str = "C:/BIN/BASH.ELF";
 
-    // Reaper loop: collect any child that exits, forever. `wait` fails
-    // with ECHILD immediately when there are no children at all, so yield
-    // in that case rather than spinning flat out.
+/// A shell that dies sooner than this is failing, not being logged out of,
+/// so wait a moment before starting another one.
+const MIN_SHELL_LIFE: Duration = Duration::from_secs(1);
+
+fn start_shell() -> Option<Pid> {
+    match process::fork() {
+        Ok(Fork::Child) => {
+            let err = process::exec(SHELL, &["bash"]);
+            eprintln!("init: can't start {}: {}", SHELL, err);
+            process::exit(127);
+        }
+        Ok(Fork::Parent(pid)) => Some(pid),
+        Err(e) => {
+            eprintln!("init: fork: {}", e);
+            None
+        }
+    }
+}
+
+fn main(_args: Args) -> i32 {
+    println!("init: started as pid {}", process::getpid());
+    let mut shell = start_shell();
+    let mut started = time::Instant::now();
+
     loop {
         match process::wait(None) {
-            Ok((pid, status)) => println!("init: reaped pid {} (status {})", pid, status),
-            Err(_) => process::yield_now(),
+            Ok((pid, _)) if Some(pid) == shell => {
+                if started.elapsed() < MIN_SHELL_LIFE {
+                    time::sleep(MIN_SHELL_LIFE);
+                }
+                shell = start_shell();
+                started = time::Instant::now();
+            }
+            Ok((pid, status)) => println!("init: reaped orphan {} (status {})", pid, status),
+            // No children at all: nothing to reap, and the fork failed.
+            Err(_) => {
+                time::sleep(MIN_SHELL_LIFE);
+                shell = start_shell();
+                started = time::Instant::now();
+            }
         }
     }
 }

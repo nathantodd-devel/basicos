@@ -30,3 +30,15 @@ pub unsafe fn inw(port: u16) -> u16 {
 pub unsafe fn io_wait() {
     outb(0x80, 0);
 }
+
+#[inline]
+pub unsafe fn outl(port: u16, value: u32) {
+    core::arch::asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack, preserves_flags));
+}
+
+#[inline]
+pub unsafe fn inl(port: u16) -> u32 {
+    let value: u32;
+    core::arch::asm!("in eax, dx", in("dx") port, out("eax") value, options(nomem, nostack, preserves_flags));
+    value
+}

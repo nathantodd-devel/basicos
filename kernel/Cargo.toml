@@ -9,6 +9,11 @@ edition = "2021"
 # `storage` (below), so reduced builds without it don't need to compile
 # or link this at all.
 basicos-fs = { path = "../fs", optional = true }
+# The ext4 filesystem (read/write, journal replay), likewise decoupled.
+basicos-ext4 = { path = "../ext4", optional = true }
+# The IPv4 stack (same story: the protocol logic lives outside the
+# kernel; see its doc comment). Optional, gated by `net`.
+basicos-net = { path = "../net", optional = true }
 
 [lib]
 name = "basicos"
@@ -30,8 +35,8 @@ default = [
     "apic",
     "usermode-demo",
     "scheduler",
-    "shell",
     "elf-loader",
+    "net",
 ]
 
 # Heap allocator (`#[global_allocator]`, `mem::heap`) — pulls in `alloc`.
@@ -47,7 +52,9 @@ frame-alloc = []
 # already sets up (that part isn't gated; it's assembly, not Cargo).
 paging = ["frame-alloc"]
 
-# ATA (PIO) disk driver + FAT32 + initrd + a writable in-memory ramdisk,
+# ATA (PIO) disk driver (all four IDE positions, LBA28/48) + partition
+# tables (MBR/GPT) + FAT32 + ext4 (read/write, journal replay) + initrd + a
+# writable in-memory ramdisk,
 # and the syscalls that use them (open/close/lseek/getdents64, the
 # file-backed paths of read/write, and the basicos-specific `tree`
 # syscall). DOS-style drive letters address the three: `A:` the
@@ -55,7 +62,7 @@ paging = ["frame-alloc"]
 # Needs `alloc` for FAT32's in-memory buffers and the ramdisk's own
 # backing store, `frame-alloc` to reserve the initrd's memory, and
 # `dep:basicos-fs` for the format implementation itself.
-storage = ["heap", "frame-alloc", "dep:basicos-fs"]
+storage = ["heap", "frame-alloc", "dep:basicos-fs", "dep:basicos-ext4"]
 
 # PS/2 keyboard driver: scancode decoding, modifier tracking, the input
 # ring buffer, and IRQ1 wiring. Off = IRQ1 stays masked at the PIC, so
@@ -81,10 +88,11 @@ apic = []
 
 # The ring-3 jump: SYSCALL/SYSRET MSR setup, the syscall dispatch table,
 # and `usermode::user_mode_stub`, which exercises it (including a
-# storage demo, if `storage` is also enabled). Superseded at boot by
+# storage demo, if `storage` is also enabled). Needs `alloc` (per-process
+# fd tables, pipes, sockets), hence `heap`. Superseded at boot by
 # `scheduler` when that's also on (see below) — off = kernel_main sets
 # everything up and then just halts, no ring-3 code ever runs.
-usermode-demo = []
+usermode-demo = ["heap"]
 
 # Process/task abstraction + a preemptive round-robin scheduler for
 # ring-0 kernel threads (see `sched`) — real tasks, a real minimal
@@ -98,10 +106,12 @@ usermode-demo = []
 # boot path still runs as before if `scheduler` is off.
 scheduler = []
 
-# An interactive command shell (builtins: help/echo/ls/cat/meminfo/
-# uptime/ps/run/clear), reading from serial if `serial-input` is on,
-# else the keyboard if `keyboard` is on, else it just sits idle. Runs as
-# a scheduler task, so this implies `scheduler`.
+# A ring-0 debug monitor (builtins: help/echo/ls/cat/meminfo/uptime/ps/
+# run/clear/...), reading from serial if `serial-input` is on, else the
+# keyboard if `keyboard` is on, else it just sits idle. Off by default:
+# the real shell is the userspace programs/bash, which init starts, and
+# with this on the two compete for console input. Runs as a scheduler
+# task, so this implies `scheduler`.
 shell = ["scheduler"]
 
 # ELF64 loader: parses an ET_EXEC binary and copies its PT_LOAD segments
@@ -113,6 +123,13 @@ shell = ["scheduler"]
 # for the per-process address spaces themselves.
 elf-loader = ["usermode-demo", "storage", "paging", "scheduler"]
 
+
+# Networking: PCI enumeration, an RTL8139 NIC driver, and the IPv4 stack
+# (ARP/IPv4/ICMP/UDP/loopback, from the `basicos-net` crate), run by a
+# polling `net` scheduler task. No NIC found just means no networking —
+# it logs that and boots on. Needs `alloc` and the frame allocator (DMA
+# buffers) and `scheduler` (the polling task).
+net = ["heap", "frame-alloc", "scheduler", "dep:basicos-net"]
 
 bad-interrupt-panic = []
 

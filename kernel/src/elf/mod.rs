@@ -114,6 +114,11 @@ pub unsafe fn load_into(space: &mut PageMapper, data: &[u8]) -> Result<u64, ElfE
 
     let zone_start = paging::PROC_CODE_START as u64;
     let zone_end = zone_start + paging::PROC_CODE_SIZE as u64;
+    // `sysretq` to a non-canonical address faults in ring 0, so a bogus
+    // entry point mustn't get as far as that.
+    if ehdr.e_entry < zone_start || ehdr.e_entry >= zone_end {
+        return Err(ElfError::UnsafeLoadAddress);
+    }
     let phentsize = ehdr.e_phentsize as usize;
     let phoff = ehdr.e_phoff as usize;
 
@@ -189,4 +194,9 @@ pub unsafe fn load_into(space: &mut PageMapper, data: &[u8]) -> Result<u64, ElfE
 /// as any other `sched::spawn`ed task.
 pub fn spawn(name: &'static str, path: &str) -> Result<u64, RunError> {
     crate::sched::spawn_process(name, path)
+}
+
+/// [`spawn`] with arguments (`argv = [path, args...]`).
+pub fn spawn_args(name: &'static str, path: &str, args: &[&str]) -> Result<u64, RunError> {
+    crate::sched::spawn_process_args(name, path, args)
 }

@@ -41,9 +41,11 @@ pub mod fs;
 pub mod heap;
 pub mod io;
 pub mod mem;
+pub mod net;
 pub mod process;
 pub mod rt;
 pub mod sys;
+pub mod time;
 
 pub use errno::{Errno, Result};
 
@@ -51,7 +53,7 @@ pub use errno::{Errno, Result};
 pub mod prelude {
     pub use crate::errno::{Errno, Result};
     pub use crate::rt::Args;
-    pub use crate::{eprint, eprintln, fs, io, mem, print, println, process};
+    pub use crate::{eprint, eprintln, fs, io, mem, net, print, println, process, time};
     pub use alloc::boxed::Box;
     pub use alloc::string::{String, ToString};
     pub use alloc::vec::Vec;

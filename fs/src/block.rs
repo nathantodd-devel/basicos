@@ -35,6 +35,24 @@ pub trait BlockDevice: Send {
 
     /// Write one block from `buf`, which must be at least `BLOCK_SIZE` bytes.
     fn write_block(&mut self, index: u64, buf: &[u8]) -> Result<(), BlockError>;
+
+    /// Read `buf.len() / BLOCK_SIZE` consecutive blocks starting at
+    /// `start`. Devices with a fast multi-block command override this;
+    /// the default is one `read_block` each.
+    fn read_blocks(&mut self, start: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+        for (i, chunk) in buf.chunks_mut(BLOCK_SIZE).enumerate() {
+            self.read_block(start + i as u64, chunk)?;
+        }
+        Ok(())
+    }
+
+    /// Write `buf.len() / BLOCK_SIZE` consecutive blocks starting at `start`.
+    fn write_blocks(&mut self, start: u64, buf: &[u8]) -> Result<(), BlockError> {
+        for (i, chunk) in buf.chunks(BLOCK_SIZE).enumerate() {
+            self.write_block(start + i as u64, chunk)?;
+        }
+        Ok(())
+    }
 }
 
 /// A read-only disk image sitting in memory — backs the kernel's

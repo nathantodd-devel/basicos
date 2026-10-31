@@ -18,7 +18,7 @@ SECTIONS
     .boot :
     {
         /* multiboot header must be within the first 8KiB of the file */
-        *(.multiboot)
+        KEEP(*(.multiboot)) /* nothing references it; --gc-sections would drop it */
     } :boot
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));

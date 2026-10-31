@@ -9,18 +9,32 @@
 //! - RDI, RSI, RDX, R10, R8, R9: arguments 1-6
 //! - RAX: return value (negative values indicate errors)
 
-#[cfg(feature = "storage")]
-use crate::{fs, sync::Spinlock};
 use crate::{pr_debug, pr_info};
 #[cfg(feature = "storage")]
+use crate::fs;
+#[cfg(feature = "storage")]
 use alloc::format;
-#[cfg(feature = "storage")]
 use alloc::string::String;
-#[cfg(feature = "storage")]
 use alloc::vec::Vec;
 
+// `pub(crate)`, not private: `shell` also reads stdin through this one
+// line discipline (see its own `read_line`) — otherwise its direct
+// driver reads and this module's independent byte-queue draining would
+// each silently steal bytes meant for the other.
+pub(crate) mod console;
+pub mod fd;
+#[cfg(feature = "storage")]
+mod file;
+mod io;
+mod misc;
+#[cfg(feature = "storage")]
+mod procfs;
+#[cfg(feature = "net")]
+mod sock;
+mod uaccess;
+
 // ============================================================================
-// Syscall Numbers (Linux-compatible where applicable)
+// Syscall Numbers (Linux x86_64 numbering)
 // ============================================================================
 
 pub mod nr {
@@ -28,28 +42,89 @@ pub mod nr {
     pub const WRITE: u64 = 1;
     pub const OPEN: u64 = 2;
     pub const CLOSE: u64 = 3;
-    pub const EXIT: u64 = 60;
-    pub const GETPID: u64 = 39;
-    pub const YIELD: u64 = 24; // sched_yield
-                               // Only meaningful with the `storage`/`elf-loader` features (see
-                               // `sys_open`/`sys_fork` etc.), but these are just numbers — matching
-                               // real syscall ABI numbers is useful documentation even when the
-                               // handler isn't compiled in, and calling one with the feature off
-                               // just falls through to `dispatch`'s "unknown syscall" arm (ENOSYS)
-                               // rather than failing to compile.
+    pub const STAT: u64 = 4;
+    pub const FSTAT: u64 = 5;
+    pub const LSTAT: u64 = 6;
+    pub const POLL: u64 = 7;
     pub const LSEEK: u64 = 8;
-    pub const GETDENTS64: u64 = 217; // matches Linux x86_64
     pub const MMAP: u64 = 9;
     pub const MUNMAP: u64 = 11;
     pub const BRK: u64 = 12;
+    pub const IOCTL: u64 = 16;
+    pub const PREAD64: u64 = 17;
+    pub const PWRITE64: u64 = 18;
+    pub const READV: u64 = 19;
+    pub const WRITEV: u64 = 20;
+    pub const ACCESS: u64 = 21;
+    pub const PIPE: u64 = 22;
+    pub const YIELD: u64 = 24; // sched_yield
+    pub const DUP: u64 = 32;
+    pub const DUP2: u64 = 33;
+    pub const NANOSLEEP: u64 = 35;
+    pub const GETPID: u64 = 39;
+    pub const SOCKET: u64 = 41;
+    pub const CONNECT: u64 = 42;
+    pub const ACCEPT: u64 = 43;
+    pub const SENDTO: u64 = 44;
+    pub const RECVFROM: u64 = 45;
+    pub const SHUTDOWN: u64 = 48;
+    pub const BIND: u64 = 49;
+    pub const LISTEN: u64 = 50;
+    pub const GETSOCKNAME: u64 = 51;
+    pub const GETPEERNAME: u64 = 52;
+    pub const SETSOCKOPT: u64 = 54;
+    pub const GETSOCKOPT: u64 = 55;
     pub const FORK: u64 = 57;
     pub const EXECVE: u64 = 59;
+    pub const EXIT: u64 = 60;
     pub const WAIT4: u64 = 61;
+    pub const KILL: u64 = 62;
+    pub const UNAME: u64 = 63;
+    pub const FCNTL: u64 = 72;
+    pub const FSYNC: u64 = 74;
+    pub const TRUNCATE: u64 = 76;
+    pub const FTRUNCATE: u64 = 77;
+    pub const GETCWD: u64 = 79;
+    pub const CHDIR: u64 = 80;
+    pub const RENAME: u64 = 82;
+    pub const MKDIR: u64 = 83;
+    pub const RMDIR: u64 = 84;
+    pub const LINK: u64 = 86;
+    pub const UNLINK: u64 = 87;
+    pub const SYMLINK: u64 = 88;
+    pub const READLINK: u64 = 89;
+    pub const CHMOD: u64 = 90;
+    pub const FCHMOD: u64 = 91;
+    pub const UMASK: u64 = 95;
+    pub const GETTIMEOFDAY: u64 = 96;
+    pub const SYSINFO: u64 = 99;
+    pub const GETUID: u64 = 102;
+    pub const GETGID: u64 = 104;
+    pub const GETEUID: u64 = 107;
+    pub const GETEGID: u64 = 108;
+    pub const GETPPID: u64 = 110;
+    pub const STATFS: u64 = 137;
+    pub const FSTATFS: u64 = 138;
+    pub const SYNC: u64 = 162;
+    pub const TIME: u64 = 201;
+    pub const GETDENTS64: u64 = 217;
+    pub const CLOCK_GETTIME: u64 = 228;
+    pub const CLOCK_GETRES: u64 = 229;
+    pub const CLOCK_NANOSLEEP: u64 = 230;
+    pub const EXIT_GROUP: u64 = 231;
+    pub const OPENAT: u64 = 257;
+    pub const MKDIRAT: u64 = 258;
+    pub const NEWFSTATAT: u64 = 262;
+    pub const UNLINKAT: u64 = 263;
+    pub const DUP3: u64 = 292;
+    pub const PIPE2: u64 = 293;
+    pub const GETRANDOM: u64 = 318;
 
-    // basicos-specific syscalls (start at 1000 to avoid Linux conflicts)
+    // basicos-specific syscalls (start at 0x400 to avoid Linux conflicts)
     pub const KLOG: u64 = 0x400; // Write to kernel log
     pub const TREE: u64 = 0x401; // Recursively list a mounted filesystem to the kernel log
     pub const KPANIC: u64 = 0x402;
+    pub const CLEAR: u64 = 0x403; // Clear the console
 }
 
 /// `mmap()` flags (arg4) — same bit values as Linux x86_64.
@@ -74,107 +149,85 @@ pub mod whence {
 }
 
 /// `open()` flags (arg2) — same bit values as Linux x86_64, so real C
-/// programs' `<fcntl.h>` constants would just work if we ever link one.
+/// programs' `<fcntl.h>` constants just work.
+#[allow(dead_code)]
 pub mod open_flags {
     pub const O_RDONLY: u64 = 0o0;
     pub const O_WRONLY: u64 = 0o1;
-    #[allow(dead_code)]
     pub const O_RDWR: u64 = 0o2;
-    #[allow(dead_code)]
     pub const O_ACCMODE: u64 = 0o3;
     pub const O_CREAT: u64 = 0o100;
+    pub const O_EXCL: u64 = 0o200;
     pub const O_TRUNC: u64 = 0o1000;
-    #[allow(dead_code)]
     pub const O_APPEND: u64 = 0o2000;
+    pub const O_NONBLOCK: u64 = 0o4000;
     pub const O_DIRECTORY: u64 = 0o200000;
+    pub const O_CLOEXEC: u64 = 0o2000000;
 }
 
 // ============================================================================
-// Error Codes (negated in return value)
+// Error Codes (negated in return value; Linux numbering)
 // ============================================================================
 
+#[allow(dead_code)]
 pub mod errno {
-    pub const ECHILD: i64 = -10; // No child processes
-    pub const EAGAIN: i64 = -11; // Try again (e.g. task table full)
-    pub const ENOMEM: i64 = -12; // Out of memory
+    pub const EPERM: i64 = -1; // Operation not permitted
     pub const ENOENT: i64 = -2; // No such file or directory
+    pub const ESRCH: i64 = -3; // No such process
     pub const EIO: i64 = -5; // I/O error
     pub const EBADF: i64 = -9; // Bad file descriptor
+    pub const ECHILD: i64 = -10; // No child processes
+    pub const EAGAIN: i64 = -11; // Try again (also: would block)
+    pub const ENOMEM: i64 = -12; // Out of memory
     pub const EFAULT: i64 = -14; // Bad address
+    pub const EBUSY: i64 = -16; // Device or resource busy
+    pub const EEXIST: i64 = -17; // File exists
+    pub const EXDEV: i64 = -18; // Cross-device link
     pub const ENODEV: i64 = -19; // No such device (filesystem not mounted)
     pub const ENOTDIR: i64 = -20; // Not a directory
     pub const EISDIR: i64 = -21; // Is a directory
     pub const EINVAL: i64 = -22; // Invalid argument
     pub const EMFILE: i64 = -24; // Too many open files
+    pub const ENOTTY: i64 = -25; // Not a typewriter
+    pub const ENOSPC: i64 = -28; // No space left on device
+    pub const ESPIPE: i64 = -29; // Illegal seek
+    pub const EROFS: i64 = -30; // Read-only file system
+    pub const EPIPE: i64 = -32; // Broken pipe
+    pub const ERANGE: i64 = -34; // Result too large
+    pub const ENAMETOOLONG: i64 = -36; // File name too long
     pub const ENOSYS: i64 = -38; // Function not implemented
+    pub const ENOTEMPTY: i64 = -39; // Directory not empty
+    pub const ENOTSOCK: i64 = -88; // Socket operation on non-socket
+    pub const EDESTADDRREQ: i64 = -89; // Destination address required
+    pub const EMSGSIZE: i64 = -90; // Message too long
+    pub const ENOPROTOOPT: i64 = -92; // Protocol not available
+    pub const EPROTONOSUPPORT: i64 = -93; // Protocol not supported
+    pub const ESOCKTNOSUPPORT: i64 = -94; // Socket type not supported
+    pub const EOPNOTSUPP: i64 = -95; // Operation not supported
+    pub const EAFNOSUPPORT: i64 = -97; // Address family not supported
+    pub const EADDRINUSE: i64 = -98; // Address already in use
+    pub const EADDRNOTAVAIL: i64 = -99; // Cannot assign requested address
+    pub const ENETUNREACH: i64 = -101; // Network is unreachable
+    pub const ENOBUFS: i64 = -105; // No buffer space available
+    pub const ENOTCONN: i64 = -107; // Transport endpoint is not connected
+    pub const E2BIG: i64 = -7; // Argument list too long
+    pub const EFBIG: i64 = -27; // File too large
+    pub const ELOOP: i64 = -40; // Too many symbolic links
 }
 
-// ============================================================================
-// File Descriptors
-// ============================================================================
-
-const STDIN: u64 = 0;
-const STDOUT: u64 = 1;
-const STDERR: u64 = 2;
-
-/// A process's open file or directory. Files are read/written entirely
-/// in memory and only touch the FAT32 driver at `open()` (read) and
-/// `close()` (write-back, if anything was written) — there's no
-/// incremental on-disk update, which keeps `sys_write` from having to
-/// know anything about clusters.
-#[cfg(feature = "storage")]
-enum OpenFile {
-    File {
-        target: fs::Drive,
-        path: String,
-        data: Vec<u8>,
-        pos: usize,
-        dirty: bool,
-    },
-    Dir {
-        entries: Vec<fs::DirEntry>,
-        pos: usize,
-    },
+/// Milliseconds since boot, at PIT-tick resolution.
+fn now_ms() -> u64 {
+    use crate::arch::interrupts::{TIMER_HZ, TIMER_TICKS};
+    TIMER_TICKS.load(core::sync::atomic::Ordering::Relaxed) * 1000 / TIMER_HZ as u64
 }
 
-#[cfg(feature = "storage")]
-const MAX_OPEN_FILES: usize = 16;
-/// fds 0-2 are stdin/stdout/stderr; real files start here.
-#[cfg(feature = "storage")]
-const FD_BASE: u64 = 3;
-
-#[cfg(feature = "storage")]
-static OPEN_FILES: Spinlock<[Option<OpenFile>; MAX_OPEN_FILES]> =
-    Spinlock::new([const { None }; MAX_OPEN_FILES]);
-
-#[cfg(feature = "storage")]
-fn fd_index(fd: u64) -> Option<usize> {
-    let idx = fd.checked_sub(FD_BASE)? as usize;
-    (idx < MAX_OPEN_FILES).then_some(idx)
-}
-
-#[cfg(feature = "storage")]
-fn alloc_fd(file: OpenFile) -> Option<u64> {
-    let mut table = OPEN_FILES.lock();
-    let (idx, slot) = table.iter_mut().enumerate().find(|(_, s)| s.is_none())?;
-    *slot = Some(file);
-    Some(idx as u64 + FD_BASE)
-}
-
-/// Copy a NUL-terminated path string out of user memory.
-///
-/// Same trust level as the rest of this syscall layer (see `sys_write`):
-/// no page-table validation, just a bounded scan. Fine for a single
-/// trusted test program; not fine for an untrusted one.
-#[cfg(feature = "storage")]
-fn read_user_cstring(ptr: u64) -> Option<String> {
-    if ptr == 0 {
-        return None;
-    }
-    const MAX_PATH: usize = 256;
-    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, MAX_PATH) };
-    let len = bytes.iter().position(|&b| b == 0)?;
-    core::str::from_utf8(&bytes[..len]).ok().map(String::from)
+/// One step of a blocking wait: hand the CPU to someone else if there is
+/// a scheduler, else just spin.
+fn relax() {
+    #[cfg(feature = "scheduler")]
+    crate::sched::yield_now();
+    #[cfg(not(feature = "scheduler"))]
+    core::hint::spin_loop();
 }
 
 // ============================================================================
@@ -195,24 +248,119 @@ pub extern "C" fn dispatch(
     arg1: u64,
     arg2: u64,
     arg3: u64,
-    #[cfg_attr(not(feature = "elf-loader"), allow(unused_variables))] arg4: u64,
-    #[cfg_attr(not(feature = "elf-loader"), allow(unused_variables))] arg5: u64,
+    arg4: u64,
+    arg5: u64,
     #[cfg_attr(not(feature = "elf-loader"), allow(unused_variables))] arg6: u64,
 ) -> i64 {
+    // Not every arm uses every argument in every feature set.
+    let _ = (arg4, arg5);
     match number {
-        nr::READ => sys_read(arg1, arg2, arg3),
-        nr::WRITE => sys_write(arg1, arg2, arg3),
+        // --- file descriptors: work on any fd -----------------------------
+        nr::READ => io::sys_read(arg1, arg2, arg3),
+        nr::WRITE => io::sys_write(arg1, arg2, arg3),
+        nr::CLOSE => io::sys_close(arg1),
+        nr::FSTAT => io::sys_fstat(arg1, arg2),
+        nr::READV => io::sys_readv(arg1, arg2, arg3),
+        nr::WRITEV => io::sys_writev(arg1, arg2, arg3),
+        nr::IOCTL => io::sys_ioctl(arg1, arg2, arg3),
+        nr::PIPE => io::sys_pipe(arg1),
+        nr::PIPE2 => io::sys_pipe2(arg1, arg2),
+        nr::DUP => io::sys_dup(arg1),
+        nr::DUP2 => io::sys_dup2(arg1, arg2),
+        nr::DUP3 => io::sys_dup3(arg1, arg2, arg3),
+        nr::FCNTL => io::sys_fcntl(arg1, arg2, arg3),
+        nr::UMASK => io::sys_umask(arg1),
+        nr::POLL => misc::sys_poll(arg1, arg2, arg3),
+
+        // --- files and directories ----------------------------------------
         #[cfg(feature = "storage")]
-        nr::OPEN => sys_open(arg1, arg2, arg3),
+        nr::OPEN => file::sys_open(arg1, arg2, arg3),
         #[cfg(feature = "storage")]
-        nr::CLOSE => sys_close(arg1),
-        nr::EXIT => sys_exit(arg1 as i32),
+        nr::OPENAT => file::sys_openat(arg1, arg2, arg3, arg4),
+        #[cfg(feature = "storage")]
+        nr::STAT => file::sys_stat(arg1, arg2),
+        #[cfg(feature = "storage")]
+        nr::LSTAT => file::sys_lstat(arg1, arg2),
+        #[cfg(feature = "storage")]
+        nr::LINK => file::sys_link(arg1, arg2),
+        #[cfg(feature = "storage")]
+        nr::SYMLINK => file::sys_symlink(arg1, arg2),
+        #[cfg(feature = "storage")]
+        nr::READLINK => file::sys_readlink(arg1, arg2, arg3),
+        #[cfg(feature = "storage")]
+        nr::CHMOD => file::sys_chmod(arg1, arg2),
+        #[cfg(feature = "storage")]
+        nr::FCHMOD => file::sys_fchmod(arg1, arg2),
+        #[cfg(feature = "storage")]
+        nr::STATFS => file::sys_statfs(arg1, arg2),
+        #[cfg(feature = "storage")]
+        nr::FSTATFS => file::sys_fstatfs(arg1, arg2),
+        #[cfg(feature = "storage")]
+        nr::SYNC => file::sys_sync(),
+        #[cfg(feature = "storage")]
+        nr::NEWFSTATAT => file::sys_newfstatat(arg1, arg2, arg3, arg4),
+        #[cfg(feature = "storage")]
+        nr::LSEEK => file::sys_lseek(arg1, arg2, arg3),
+        #[cfg(feature = "storage")]
+        nr::PREAD64 => file::sys_pread64(arg1, arg2, arg3, arg4),
+        #[cfg(feature = "storage")]
+        nr::PWRITE64 => file::sys_pwrite64(arg1, arg2, arg3, arg4),
+        #[cfg(feature = "storage")]
+        nr::ACCESS => file::sys_access(arg1, arg2),
+        #[cfg(feature = "storage")]
+        nr::FSYNC => file::sys_fsync(arg1),
+        #[cfg(feature = "storage")]
+        nr::TRUNCATE => file::sys_truncate(arg1, arg2),
+        #[cfg(feature = "storage")]
+        nr::FTRUNCATE => file::sys_ftruncate(arg1, arg2),
+        #[cfg(feature = "storage")]
+        nr::GETCWD => file::sys_getcwd(arg1, arg2),
+        #[cfg(feature = "storage")]
+        nr::CHDIR => file::sys_chdir(arg1),
+        #[cfg(feature = "storage")]
+        nr::RENAME => file::sys_rename(arg1, arg2),
+        #[cfg(feature = "storage")]
+        nr::MKDIR => file::sys_mkdir(arg1, arg2),
+        #[cfg(feature = "storage")]
+        nr::MKDIRAT => file::sys_mkdirat(arg1, arg2, arg3),
+        #[cfg(feature = "storage")]
+        nr::RMDIR => file::sys_rmdir(arg1),
+        #[cfg(feature = "storage")]
+        nr::UNLINK => file::sys_unlink(arg1),
+        #[cfg(feature = "storage")]
+        nr::UNLINKAT => file::sys_unlinkat(arg1, arg2, arg3),
+        #[cfg(feature = "storage")]
+        nr::GETDENTS64 => file::sys_getdents64(arg1, arg2, arg3),
+
+        // --- sockets (UDP) ---------------------------------------------------
+        #[cfg(feature = "net")]
+        nr::SOCKET => sock::sys_socket(arg1, arg2, arg3),
+        #[cfg(feature = "net")]
+        nr::BIND => sock::sys_bind(arg1, arg2, arg3),
+        #[cfg(feature = "net")]
+        nr::CONNECT => sock::sys_connect(arg1, arg2, arg3),
+        #[cfg(feature = "net")]
+        nr::SENDTO => sock::sys_sendto(arg1, arg2, arg3, arg4, arg5, arg6),
+        #[cfg(feature = "net")]
+        nr::RECVFROM => sock::sys_recvfrom(arg1, arg2, arg3, arg4, arg5, arg6),
+        #[cfg(feature = "net")]
+        nr::GETSOCKNAME => sock::sys_getsockname(arg1, arg2, arg3),
+        #[cfg(feature = "net")]
+        nr::GETPEERNAME => sock::sys_getpeername(arg1, arg2, arg3),
+        #[cfg(feature = "net")]
+        nr::SETSOCKOPT => sock::sys_setsockopt(arg1, arg2, arg3, arg4, arg5),
+        #[cfg(feature = "net")]
+        nr::GETSOCKOPT => sock::sys_getsockopt(arg1, arg2, arg3, arg4, arg5),
+        #[cfg(feature = "net")]
+        nr::SHUTDOWN => sock::sys_shutdown(arg1, arg2),
+        #[cfg(feature = "net")]
+        nr::LISTEN | nr::ACCEPT => sock::sys_listen_accept(arg1),
+
+        // --- processes ---------------------------------------------------------
+        nr::EXIT | nr::EXIT_GROUP => sys_exit(arg1 as i32),
         nr::GETPID => sys_getpid(),
+        nr::GETPPID => misc::sys_getppid(),
         nr::YIELD => sys_yield(),
-        #[cfg(feature = "storage")]
-        nr::LSEEK => sys_lseek(arg1, arg2, arg3),
-        #[cfg(feature = "storage")]
-        nr::GETDENTS64 => sys_getdents64(arg1, arg2, arg3),
         #[cfg(feature = "elf-loader")]
         nr::MMAP => sys_mmap(arg1, arg2, arg3, arg4, arg5, arg6),
         #[cfg(feature = "elf-loader")]
@@ -225,10 +373,30 @@ pub extern "C" fn dispatch(
         nr::EXECVE => sys_execve(arg1, arg2, arg3),
         #[cfg(feature = "elf-loader")]
         nr::WAIT4 => sys_wait4(arg1, arg2, arg3),
+        #[cfg(feature = "elf-loader")]
+        nr::KILL => misc::sys_kill(arg1, arg2),
+        nr::GETUID | nr::GETGID | nr::GETEUID | nr::GETEGID => misc::sys_root_id(),
+
+        // --- time and system info ---------------------------------------------
+        nr::NANOSLEEP => misc::sys_nanosleep(arg1, arg2),
+        nr::CLOCK_NANOSLEEP => misc::sys_clock_nanosleep(arg1, arg2, arg3, arg4),
+        nr::CLOCK_GETTIME => misc::sys_clock_gettime(arg1, arg2),
+        nr::CLOCK_GETRES => misc::sys_clock_getres(arg1, arg2),
+        nr::GETTIMEOFDAY => misc::sys_gettimeofday(arg1, arg2),
+        nr::TIME => misc::sys_time(arg1),
+        nr::UNAME => misc::sys_uname(arg1),
+        nr::SYSINFO => misc::sys_sysinfo(arg1),
+        nr::GETRANDOM => misc::sys_getrandom(arg1, arg2, arg3),
+
+        // --- basicos-specific --------------------------------------------------
         nr::KLOG => sys_klog(arg1, arg2),
         #[cfg(feature = "storage")]
         nr::TREE => sys_tree(arg1),
+        // The no-scheduler demo's panic test. Never reachable from a real
+        // process: a program must not be able to take the kernel down.
+        #[cfg(not(feature = "scheduler"))]
         nr::KPANIC => sys_kpanic(),
+        nr::CLEAR => sys_clear(),
         _ => {
             pr_debug!("Unknown syscall: {}", number);
             errno::ENOSYS
@@ -240,304 +408,12 @@ pub extern "C" fn dispatch(
 // Syscall Implementations
 // ============================================================================
 
-/// read(fd, buf, count) - Read from a file descriptor.
-fn sys_read(fd: u64, buf: u64, count: u64) -> i64 {
-    match fd {
-        STDIN => {
-            // Would read from keyboard buffer
-            pr_debug!("sys_read: stdin not implemented");
-            0 // EOF for now
-        }
-        STDOUT | STDERR => errno::EBADF, // write-only
-        #[cfg(feature = "storage")]
-        _ => {
-            let Some(idx) = fd_index(fd) else {
-                return errno::EBADF;
-            };
-            let mut table = OPEN_FILES.lock();
-            match table[idx].as_mut() {
-                Some(OpenFile::File { data, pos, .. }) => {
-                    let n = (count as usize).min(data.len().saturating_sub(*pos));
-                    if n == 0 {
-                        return 0; // EOF
-                    }
-                    if buf == 0 {
-                        return errno::EFAULT;
-                    }
-                    // Safety: same trust level as sys_write below.
-                    let dest = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, n) };
-                    dest.copy_from_slice(&data[*pos..*pos + n]);
-                    *pos += n;
-                    n as i64
-                }
-                Some(OpenFile::Dir { .. }) => errno::EISDIR,
-                None => errno::EBADF,
-            }
-        }
-        #[cfg(not(feature = "storage"))]
-        _ => errno::EBADF, // no file table without `storage`
-    }
-}
-
-/// write(fd, buf, count) - Write to a file descriptor.
-fn sys_write(fd: u64, buf: u64, count: u64) -> i64 {
-    match fd {
-        STDOUT | STDERR => {
-            // Validate pointer (basic check - just ensure it's in user space)
-            // In a real kernel, we'd check against the process's memory map
-            if buf == 0 {
-                return errno::EFAULT;
-            }
-
-            // Safety: We're trusting the user pointer here. In a real kernel,
-            // we'd use copy_from_user() with proper validation.
-            let slice = unsafe { core::slice::from_raw_parts(buf as *const u8, count as usize) };
-
-            // Convert to string and print
-            if let Ok(s) = core::str::from_utf8(slice) {
-                // Write to VGA
-                crate::drivers::vga::print(s);
-                // Also to serial
-                crate::drivers::serial::write_str(s);
-                count as i64
-            } else {
-                // Not valid UTF-8, write byte by byte
-                for &byte in slice {
-                    crate::drivers::vga::print_char(byte);
-                    crate::drivers::serial::write_byte(byte);
-                }
-                count as i64
-            }
-        }
-        #[cfg(feature = "storage")]
-        _ => {
-            let Some(idx) = fd_index(fd) else {
-                return errno::EBADF;
-            };
-            if buf == 0 {
-                return errno::EFAULT;
-            }
-            // Safety: trusting the user pointer, same as everywhere else
-            // in this syscall layer — see the STDOUT/STDERR arm above.
-            let src = unsafe { core::slice::from_raw_parts(buf as *const u8, count as usize) };
-            let mut table = OPEN_FILES.lock();
-            match table[idx].as_mut() {
-                Some(OpenFile::File {
-                    data, pos, dirty, ..
-                }) => {
-                    let end = *pos + src.len();
-                    if data.len() < end {
-                        data.resize(end, 0);
-                    }
-                    data[*pos..end].copy_from_slice(src);
-                    *pos = end;
-                    *dirty = true;
-                    src.len() as i64
-                }
-                Some(OpenFile::Dir { .. }) => errno::EISDIR,
-                None => errno::EBADF,
-            }
-        }
-        #[cfg(not(feature = "storage"))]
-        _ => errno::EBADF, // no file table without `storage`
-    }
-}
-
-/// open(path, flags, mode) - Open (optionally creating) a file or
-/// directory on one of the mounted FAT32 filesystems, returning a new
-/// fd. `path` is resolved by `fs::resolve_path`: DOS-style drive
-/// letters (`A:`/`B:`/`C:`), or the older no-prefix/`/initrd/...` rules.
-#[cfg(feature = "storage")]
-fn sys_open(path_ptr: u64, flags: u64, _mode: u64) -> i64 {
-    use open_flags::*;
-
-    let Some(path) = read_user_cstring(path_ptr) else {
-        return errno::EFAULT;
-    };
-    let (target, rel_path) = fs::resolve_path(&path);
-    let rel_path = String::from(rel_path);
-    let creating = flags & O_CREAT != 0;
-    let truncating = flags & O_TRUNC != 0;
-
-    let opened: Option<Result<OpenFile, i64>> = fs::with_drive(target, |vol| {
-        if rel_path.is_empty() {
-            return vol
-                .read_dir_at("/")
-                .map(|entries| OpenFile::Dir { entries, pos: 0 })
-                .map_err(|_| errno::EIO);
-        }
-        match vol.find(&rel_path) {
-            Ok(entry) if entry.is_dir => vol
-                .read_dir_at(&rel_path)
-                .map(|entries| OpenFile::Dir { entries, pos: 0 })
-                .map_err(|_| errno::EIO),
-            Ok(entry) => {
-                let data = if truncating {
-                    Vec::new()
-                } else {
-                    vol.read_file(&entry).map_err(|_| errno::EIO)?
-                };
-                Ok(OpenFile::File {
-                    target,
-                    path: rel_path.clone(),
-                    data,
-                    pos: 0,
-                    dirty: truncating,
-                })
-            }
-            Err(fs::Fat32Error::NotFound) if creating => Ok(OpenFile::File {
-                target,
-                path: rel_path.clone(),
-                data: Vec::new(),
-                pos: 0,
-                dirty: true,
-            }),
-            Err(fs::Fat32Error::NotFound) => Err(errno::ENOENT),
-            Err(_) => Err(errno::EIO),
-        }
-    });
-
-    match opened {
-        None => errno::ENODEV,
-        Some(Err(e)) => e,
-        Some(Ok(file)) => alloc_fd(file).unwrap_or(errno::EMFILE as u64) as i64,
-    }
-}
-
-/// close(fd) - Close a file descriptor, flushing any writes to disk.
-#[cfg(feature = "storage")]
-fn sys_close(fd: u64) -> i64 {
-    let Some(idx) = fd_index(fd) else {
-        return errno::EBADF;
-    };
-    let file = OPEN_FILES.lock()[idx].take();
-    match file {
-        None => errno::EBADF,
-        Some(OpenFile::Dir { .. }) => 0,
-        Some(OpenFile::File {
-            target,
-            path,
-            data,
-            dirty,
-            ..
-        }) => {
-            if !dirty {
-                return 0;
-            }
-            match fs::with_drive(target, |vol| vol.write_file(&path, &data)) {
-                Some(Ok(())) => 0,
-                Some(Err(_)) => errno::EIO,
-                None => errno::ENODEV,
-            }
-        }
-    }
-}
-
-/// lseek(fd, offset, whence) - Reposition a file's read/write cursor.
-/// `offset` is reinterpreted as signed (matches the Linux ABI, where
-/// it's `off_t`); `whence` is one of `whence::{SEEK_SET,SEEK_CUR,SEEK_END}`.
-/// Returns the resulting offset, or a negative errno.
-#[cfg(feature = "storage")]
-fn sys_lseek(fd: u64, offset: u64, whence: u64) -> i64 {
-    let Some(idx) = fd_index(fd) else {
-        return errno::EBADF;
-    };
-    let offset = offset as i64;
-    let mut table = OPEN_FILES.lock();
-    match table[idx].as_mut() {
-        Some(OpenFile::File { data, pos, .. }) => {
-            let base = match whence {
-                whence::SEEK_SET => 0,
-                whence::SEEK_CUR => *pos as i64,
-                whence::SEEK_END => data.len() as i64,
-                _ => return errno::EINVAL,
-            };
-            match base.checked_add(offset) {
-                Some(new_pos) if new_pos >= 0 => {
-                    *pos = new_pos as usize;
-                    new_pos
-                }
-                _ => errno::EINVAL,
-            }
-        }
-        Some(OpenFile::Dir { .. }) => errno::EISDIR,
-        None => errno::EBADF,
-    }
-}
-
-/// getdents64(fd, dirp, count) - Read directory entries into `dirp` as
-/// packed `linux_dirent64` records, matching glibc's `readdir()` ABI:
-///
-/// ```c
-/// struct linux_dirent64 {
-///     ino64_t        d_ino;
-///     off64_t        d_off;
-///     unsigned short d_reclen;
-///     unsigned char  d_type;
-///     char           d_name[];  // NUL-terminated
-/// };
-/// ```
-///
-/// Fills as many entries as fit in `count` bytes and returns the byte
-/// count written (0 once the directory is exhausted), advancing the
-/// fd's position — callers loop until it returns 0, same as Linux.
-#[cfg(feature = "storage")]
-fn sys_getdents64(fd: u64, dirp: u64, count: u64) -> i64 {
-    const HEADER_LEN: usize = 19; // d_ino(8) + d_off(8) + d_reclen(2) + d_type(1)
-    const DT_DIR: u8 = 4;
-    const DT_REG: u8 = 8;
-
-    let Some(idx) = fd_index(fd) else {
-        return errno::EBADF;
-    };
-    if dirp == 0 {
-        return errno::EFAULT;
-    }
-
-    let mut table = OPEN_FILES.lock();
-    let (entries, pos) = match table[idx].as_mut() {
-        Some(OpenFile::Dir { entries, pos }) => (entries, pos),
-        Some(OpenFile::File { .. }) => return errno::ENOTDIR,
-        None => return errno::EBADF,
-    };
-
-    // Safety: same trust level as sys_read/sys_write.
-    let out = unsafe { core::slice::from_raw_parts_mut(dirp as *mut u8, count as usize) };
-    let mut written = 0usize;
-
-    while *pos < entries.len() {
-        let entry = &entries[*pos];
-        let name = entry.name.as_bytes();
-        // NUL-terminated name, record padded to 8-byte alignment (glibc
-        // relies on d_reclen being a multiple of 8 to walk the buffer).
-        let reclen = (HEADER_LEN + name.len() + 1 + 7) & !7;
-        if written + reclen > out.len() {
-            break; // caller's buffer is full; they'll call again
-        }
-
-        let rec = &mut out[written..written + reclen];
-        rec.fill(0);
-        let ino = *pos as u64 + 1; // no real inode numbers, just unique+nonzero
-        rec[0..8].copy_from_slice(&ino.to_le_bytes());
-        rec[8..16].copy_from_slice(&ino.to_le_bytes()); // d_off (unused by us)
-        rec[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
-        rec[18] = if entry.is_dir { DT_DIR } else { DT_REG };
-        rec[HEADER_LEN..HEADER_LEN + name.len()].copy_from_slice(name);
-        // rec[HEADER_LEN + name.len()] is already 0 (NUL) from fill(0).
-
-        written += reclen;
-        *pos += 1;
-    }
-
-    written as i64
-}
-
 /// exit(status) - Terminate the current process. Frees its address space
 /// immediately and turns it into a zombie for a parent's `wait`/`waitpid`
 /// to reap (see `sched::exit_process`) — or, without `elf-loader` (so no
 /// real process table exists at all), just halts as before.
 fn sys_exit(status: i32) -> i64 {
-    pr_info!("Process exited with status: {}", status);
+    pr_debug!("Process exited with status: {}", status);
     #[cfg(feature = "elf-loader")]
     crate::sched::exit_process(status);
     #[cfg(not(feature = "elf-loader"))]
@@ -580,29 +456,23 @@ fn sys_fork() -> i64 {
 }
 
 /// Read a NULL-terminated array of user pointers-to-C-strings (an
-/// `argv`/`envp`-shaped array) into owned `String`s. Same trust level as
-/// `read_user_cstring`: a bounded scan, no page-table validation.
+/// `argv`/`envp`-shaped array) into owned `String`s, validating every
+/// pointer. At most `MAX_ARGS` entries.
 #[cfg(feature = "elf-loader")]
-fn read_user_argv(ptr: u64) -> Vec<String> {
-    const MAX_ARGS: usize = 16;
+fn read_user_argv(ptr: u64) -> Result<Vec<String>, i64> {
+    const MAX_ARGS: usize = 32;
     let mut out = Vec::new();
     if ptr == 0 {
-        return out;
+        return Ok(out);
     }
-    // Safety: bounded read of up to MAX_ARGS pointers; the loop below
-    // stops at the first NULL, so this never reads past whichever comes
-    // first — the real terminator or index MAX_ARGS.
-    let ptrs = unsafe { core::slice::from_raw_parts(ptr as *const u64, MAX_ARGS) };
-    for &p in ptrs {
+    for i in 0..MAX_ARGS as u64 {
+        let p: u64 = uaccess::get(ptr + i * 8)?;
         if p == 0 {
-            break;
+            return Ok(out);
         }
-        match read_user_cstring(p) {
-            Some(s) => out.push(s),
-            None => break,
-        }
+        out.push(uaccess::cstring(p)?);
     }
-    out
+    Err(errno::E2BIG)
 }
 
 /// execve(path, argv, envp) - Replace the calling process's own image
@@ -612,10 +482,14 @@ fn read_user_argv(ptr: u64) -> Vec<String> {
 /// empty environment.
 #[cfg(feature = "elf-loader")]
 fn sys_execve(path_ptr: u64, argv_ptr: u64, _envp_ptr: u64) -> i64 {
-    let Some(path) = read_user_cstring(path_ptr) else {
-        return errno::EFAULT;
+    let path = match uaccess::cstring(path_ptr) {
+        Ok(p) => p,
+        Err(e) => return e,
     };
-    let argv = read_user_argv(argv_ptr);
+    let argv = match read_user_argv(argv_ptr) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
     let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     match crate::sched::exec_current(&path, &argv_refs) {
         Ok(()) => 0, // never actually observed — the new program starts fresh
@@ -637,7 +511,9 @@ fn sys_wait4(pid: u64, status_ptr: u64, _options: u64) -> i64 {
     match crate::sched::wait_for_child(target) {
         Some((child_pid, status)) => {
             if status_ptr != 0 {
-                unsafe { *(status_ptr as *mut i32) = status };
+                if let Err(e) = uaccess::put(status_ptr, status) {
+                    return e;
+                }
             }
             child_pid as i64
         }
@@ -686,11 +562,10 @@ fn sys_brk(addr: u64) -> i64 {
 
 /// klog(buf, len) - Write directly to kernel log (basicos-specific).
 fn sys_klog(buf: u64, len: u64) -> i64 {
-    if buf == 0 {
-        return errno::EFAULT;
-    }
-
-    let slice = unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) };
+    let slice = match uaccess::slice(buf, len as usize) {
+        Ok(slice) => slice,
+        Err(e) => return e,
+    };
 
     if let Ok(s) = core::str::from_utf8(slice) {
         pr_info!("[user] {}", s);
@@ -732,7 +607,7 @@ fn sys_tree(target: u64) -> i64 {
 /// Recursively print `path`'s contents (indented by `depth`) to the
 /// kernel log, descending into subdirectories.
 #[cfg(feature = "storage")]
-fn print_tree(fs: &mut fs::Fat32Fs, path: &str, depth: usize) -> Result<(), fs::Fat32Error> {
+fn print_tree(fs: &mut dyn fs::FileSystem, path: &str, depth: usize) -> Result<(), fs::FsError> {
     if depth == 0 {
         pr_info!("[user] /");
     }
@@ -753,8 +628,18 @@ fn print_tree(fs: &mut fs::Fat32Fs, path: &str, depth: usize) -> Result<(), fs::
     Ok(())
 }
 
+#[cfg(not(feature = "scheduler"))]
 fn sys_kpanic() -> i64 {
     panic!("Test panic invoked from usermode");
+}
+
+/// clear() - Clear the VGA screen, and the terminal on the serial port.
+fn sys_clear() -> i64 {
+    crate::drivers::vga::clear_screen();
+    for &b in b"\x1b[2J\x1b[H" {
+        crate::drivers::serial::write_byte(b);
+    }
+    0
 }
 
 // ============================================================================

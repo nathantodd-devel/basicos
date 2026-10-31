@@ -26,8 +26,12 @@ extern crate alloc;
 
 pub mod block;
 pub mod fat32;
+pub mod partition;
+pub mod path;
 pub mod ramdisk;
+pub mod vfs;
 
 pub use block::{BlockDevice, BlockError, MemDisk, BLOCK_SIZE};
-pub use fat32::{DirEntry, Fat32Error, Fat32Fs};
+pub use fat32::{Fat32Error, Fat32Fs};
+pub use vfs::{Attr, DirEntry, FileSystem, FsError, FsResult};
 pub use ramdisk::RamDisk;
