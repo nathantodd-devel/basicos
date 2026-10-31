@@ -196,17 +196,35 @@ release folder on the host:
 ./docker-build.sh -o /some/dir           # somewhere else
 ./docker-build.sh --features heap,keyboard   # reduced kernel (see Cargo features)
 ./docker-build.sh --no-cache             # force a full rebuild
+./docker-build.sh --no-sign              # skip the GPG signature
 ```
 
 It uses Docker if the daemon is reachable, otherwise rootless Podman
 (`ENGINE=podman|docker` to force one). The release folder contains
 `basicos.iso` (bootable), `kernel.bin` (stripped), `initrd.img`,
 `testprog.elf`, `disk.img.gz` (the 2 GiB `C:` test disk, gzipped — it's
-almost all zeros), `run.sh`, `BUILD-INFO.txt`, and `SHA256SUMS`. To try it:
+almost all zeros), `run.sh`, `BUILD-INFO.txt`, `SHA256SUMS`, and, when
+signed, `SHA256SUMS.asc` and `basicos-signing-key.asc`. To try it:
 
 ```sh
 cd release && ./run.sh        # needs qemu-system-x86_64
 ```
+
+Releases are signed on the host after the build, so the private key never
+enters the container; the script stops before building if the key isn't
+available. `SIGNING_KEY=<id>` picks a different key, and
+`tools/sign-release.sh <dir>` signs a folder again. To verify one:
+
+```sh
+gpg --import basicos-signing-key.asc
+gpg --verify SHA256SUMS.asc SHA256SUMS
+sha256sum --check SHA256SUMS
+```
+
+The signing key's fingerprint is
+`E54C 1041 23A2 2A44 D269  56F7 4B86 F8E2 8888 92DC`. Compare it with what
+`gpg --verify` reports: the key in the folder only proves a match with
+itself, so anyone who altered a release could swap that too.
 
 The container pins a specific dated nightly (this kernel uses unstable
 features, so a floating `nightly` can break it); bump it with

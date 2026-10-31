@@ -85,7 +85,7 @@ RUN mkdir -p /release \
       echo "toolchain:  $(rustc --version)"; \
       echo "grub:       $(grub-mkrescue --version)"; \
     } > /release/BUILD-INFO.txt \
- && cd /release && sha256sum basicos.iso kernel.bin initrd.img testprog.elf disk.img.gz run.sh > SHA256SUMS
+ && cd /release && sha256sum basicos.iso kernel.bin initrd.img testprog.elf disk.img.gz run.sh BUILD-INFO.txt > SHA256SUMS
 
 FROM scratch AS export
 COPY --from=builder /release/ /

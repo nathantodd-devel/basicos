@@ -6,10 +6,14 @@
 #   ./docker-build.sh -o /tmp/out             # -> /tmp/out/
 #   ./docker-build.sh --features heap,keyboard
 #   ./docker-build.sh --no-cache              # force a full rebuild
+#   ./docker-build.sh --no-sign               # skip the GPG signature
 #   RUST_TOOLCHAIN=nightly ./docker-build.sh  # try the latest nightly
 #
 # The release folder contains: basicos.iso (bootable), kernel.bin,
-# initrd.img, testprog.elf, disk.img.gz, run.sh, BUILD-INFO.txt, SHA256SUMS.
+# initrd.img, testprog.elf, disk.img.gz, run.sh, BUILD-INFO.txt, SHA256SUMS,
+# and, when signed, SHA256SUMS.asc and basicos-signing-key.asc. Signing
+# happens here on the host (tools/sign-release.sh), so the private key
+# never reaches the container. SIGNING_KEY=<id> uses a different key.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -17,6 +21,7 @@ cd "$(dirname "$0")"
 OUT=release
 FEATURES=""
 EXTRA=()
+SIGN=1
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -29,12 +34,19 @@ while [ $# -gt 0 ]; do
             FEATURES="--no-default-features --features ${2:?--features needs a list}"; shift 2 ;;
         --no-cache)
             EXTRA+=(--no-cache); shift ;;
+        --no-sign)
+            SIGN=0; shift ;;
         -h|--help)
-            sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+            sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)
             echo "docker-build.sh: unknown argument: $1 (try --help)" >&2; exit 2 ;;
     esac
 done
+
+# Find out now, not after the build, if there's no key to sign with.
+if [ "$SIGN" = 1 ]; then
+    tools/sign-release.sh --check
+fi
 
 # Prefer docker, but only if the daemon is actually reachable (installed
 # but not in the `docker` group is a common state — `docker info` fails
@@ -70,6 +82,8 @@ if [ -n "${RUST_TOOLCHAIN:-}" ]; then
 fi
 
 mkdir -p "$OUT"
+# A signature from an earlier build mustn't sit beside these new files.
+rm -f "$OUT/SHA256SUMS.asc" "$OUT/basicos-signing-key.asc"
 echo ">> building with $ENGINE (rev ${GIT_REV}, features: ${FEATURES:-<defaults>})"
 
 # `--target export --output` copies only the FROM-scratch stage's contents
@@ -85,6 +99,12 @@ else
     podman cp "${CID}:/." "$OUT"
     podman rm "$CID" >/dev/null
     podman rmi "$IMG" >/dev/null
+fi
+
+if [ "$SIGN" = 1 ]; then
+    tools/sign-release.sh "$OUT"
+else
+    echo ">> not signed (--no-sign)"
 fi
 
 echo
