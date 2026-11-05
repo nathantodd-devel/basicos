@@ -36,6 +36,8 @@ try:
     run("help", "ifconfig arp ping")
     run("ps", r"\n\s+1\s+0\s+\w+\s+INIT\.ELF")
     run("ps", r"\[net\]")
+    run("dmesg", "INFO: basicos booted!")
+    run("dmesg", r"(?m)^\[ *\d+\.\d+\] INFO: Features: heap paging .*\bnet\r?$")
     run("meminfo", r"frames: \d+/\d+ free")
     run("uptime", r"uptime: \d+\.\d+s")
     run("drives", r"C:\s+fat32")

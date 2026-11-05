@@ -33,6 +33,12 @@
 # See [features] in kernel/Cargo.toml for the full list and what each
 # gates.
 #
+# Messages less serious than LOG_LEVEL are compiled out of the kernel, which
+# also keeps them out of `dmesg`:
+#   make LOG_LEVEL=warn
+# One of emerg, alert, crit, err, warn, notice, info, debug. Empty (the
+# default) means debug in a debug build and info in a release one.
+#
 # Workspace layout: kernel/ (the OS, a custom no_std target) and fs/
 # (the FAT32 format, an ordinary host-target crate kernel/ depends on
 # and a future host-side tool could too — see fs/src/lib.rs) are Cargo
@@ -62,6 +68,9 @@ MMD			:= mmd
 # Empty (the default) means "use Cargo.toml's default features" — i.e.
 # everything.
 FEATURES    :=
+
+# See the note at the top of this file.
+LOG_LEVEL   :=
 
 # Debug build paths
 DEBUG_LIB   := target/$(TARGET_SPEC)/debug/libbasicos.a
@@ -165,7 +174,7 @@ $(ASM_OBJ): kernel/entrypoint.s | $(BUILD_DIR)
 # ============================================================================
 
 $(DEBUG_LIB): $(RUST_SOURCES) kernel/Cargo.toml fs/Cargo.toml kernel/$(TARGET_SPEC).json kernel/.cargo/config.toml FORCE
-	cd kernel && $(CARGO) -Zjson-target-spec build $(FEATURES)
+	cd kernel && BASICOS_LOG_LEVEL=$(LOG_LEVEL) $(CARGO) -Zjson-target-spec build $(FEATURES)
 
 # Named kernel-bin, not kernel — a target literally named `kernel` would
 # collide with the kernel/ directory (harmless in principle, since
@@ -186,7 +195,7 @@ iso: kernel-bin initrd
 # ============================================================================
 
 $(RELEASE_LIB): $(RUST_SOURCES) kernel/Cargo.toml fs/Cargo.toml kernel/$(TARGET_SPEC).json kernel/.cargo/config.toml FORCE
-	cd kernel && $(CARGO) -Zjson-target-spec build --release $(FEATURES)
+	cd kernel && BASICOS_LOG_LEVEL=$(LOG_LEVEL) $(CARGO) -Zjson-target-spec build --release $(FEATURES)
 
 kernel-release: $(ASM_OBJ) $(RELEASE_LIB) kernel/linker.ld
 	$(LD) -n --gc-sections -T kernel/linker.ld -o $(RELEASE_BIN) $(ASM_OBJ) $(RELEASE_LIB)

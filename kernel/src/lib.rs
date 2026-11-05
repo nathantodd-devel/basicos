@@ -231,6 +231,8 @@ pub extern "C" fn kernel_main(magic: u64, mb_info_addr: u64) -> ! {
     let brand = cpu_info::get_cpu_brand();
     pr_info!("CPU: {} - {}", vendor.as_str(), brand.as_str());
 
+    log_features();
+
     // Boot tail. Exactly one of these arms diverges, whatever the feature
     // set (see `make feature-check`):
     //   scheduler on        -> spawn what's enabled, then `sched::run()`
@@ -283,6 +285,30 @@ pub extern "C" fn kernel_main(magic: u64, mb_info_addr: u64) -> ! {
             unsafe { core::arch::asm!("cli", "hlt") };
         }
     }
+}
+
+/// Log which optional subsystems this kernel was built with.
+fn log_features() {
+    pr_start!(Info, "Features:");
+    #[cfg(feature = "heap")]
+    pr_cont!(" heap");
+    #[cfg(feature = "paging")]
+    pr_cont!(" paging");
+    #[cfg(feature = "storage")]
+    pr_cont!(" storage");
+    #[cfg(feature = "keyboard")]
+    pr_cont!(" keyboard");
+    #[cfg(feature = "serial-input")]
+    pr_cont!(" serial-input");
+    #[cfg(feature = "scheduler")]
+    pr_cont!(" scheduler");
+    #[cfg(feature = "elf-loader")]
+    pr_cont!(" elf-loader");
+    #[cfg(feature = "net")]
+    pr_cont!(" net");
+    #[cfg(feature = "shell")]
+    pr_cont!(" shell");
+    pr_cont!("\n");
 }
 
 #[cfg(feature = "usermode-demo")]

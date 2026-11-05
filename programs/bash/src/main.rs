@@ -122,6 +122,7 @@ fn builtin_help() {
     println!("programs in C:/BIN/:");
     println!("  ls cat write rm mv mkdir rmdir   files");
     println!("  ps meminfo uptime drives date    system state");
+    println!("  dmesg                            the kernel log");
     println!("  ifconfig arp ping                network");
     println!("  clear                            clear the screen");
     println!("anything else is run as a program: fork, exec, wait for it to exit.");

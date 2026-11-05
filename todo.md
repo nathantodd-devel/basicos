@@ -3,9 +3,9 @@
 ## Logging System Enhancements
 
 - [x] Reprogram PIT to 100Hz for accurate timestamps (currently using default ~18.2Hz)
-- [ ] Add `pr_cont!` macro for continuation lines (like Linux's `KERN_CONT`)
-- [ ] Implement `dmesg` command to dump ring buffer contents
-- [ ] Add log level filtering at compile time (strip debug logs from release builds)
+- [x] `pr_cont!` for continuation lines, opened by `pr_start!` since `pr_info!` and friends end their own line. A message from another task ends the open line rather than joining it, and a continuation that lost its line starts a new one
+- [x] `dmesg` command, reading the ring buffer through `/proc/dmesg`
+- [x] Compile-time log level filtering: `make LOG_LEVEL=warn` strips anything less serious, code and strings included. Default is `debug` in debug builds, `info` in release
 - [ ] Consider adding structured logging (key=value pairs)
 
 ## Memory Management

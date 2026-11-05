@@ -12,6 +12,7 @@ use core::fmt::Write;
 pub fn read(name: &str) -> Option<Vec<u8>> {
     let mut s = String::new();
     match name {
+        "dmesg" => dmesg(&mut s),
         "tasks" => tasks(&mut s),
         "meminfo" => meminfo(&mut s),
         "uptime" => uptime(&mut s),
@@ -23,6 +24,19 @@ pub fn read(name: &str) -> Option<Vec<u8>> {
         _ => return None,
     }
     Some(s.into_bytes())
+}
+
+/// The kernel log. Once the buffer has wrapped, its oldest line has lost
+/// its start (which may even be in the middle of a character), so that
+/// line is dropped.
+fn dmesg(s: &mut String) {
+    let mut bytes = Vec::with_capacity(crate::log::LOG_BUFFER_SIZE);
+    crate::log::read_log(|b| bytes.push(b));
+    let start = match crate::log::log_wrapped() {
+        true => bytes.iter().position(|&b| b == b'\n').map_or(bytes.len(), |i| i + 1),
+        false => 0,
+    };
+    s.push_str(&String::from_utf8_lossy(&bytes[start..]));
 }
 
 fn tasks(s: &mut String) {

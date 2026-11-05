@@ -132,6 +132,11 @@ override the Makefile's `FEATURES` variable:
 make FEATURES="--no-default-features --features heap,keyboard"
 ```
 
+`make LOG_LEVEL=warn` compiles out kernel messages less serious than that
+(`emerg`, `alert`, `crit`, `err`, `warn`, `notice`, `info`, `debug`). They
+leave no code or strings behind, and so don't appear in `dmesg` either. By
+default debug builds keep everything and release builds drop `pr_debug!`.
+
 With `scheduler` on (the default), the kernel starts `C:/INIT.ELF` (with
 `elf-loader`), and everything else in userspace comes from init, instead of
 running the fixed `usermode-demo` program — the two don't compose (see

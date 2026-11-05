@@ -1,6 +1,7 @@
 //! isotest — check that the kernel contains a misbehaving process: touching
 //! kernel memory or NULL kills just that process, a failed exec leaves its
-//! caller intact, and orphans go to init. Run by `make shell-test`.
+//! caller intact, and orphans go to init. It also fills the kernel log past
+//! its capacity, to check how that reads back. Run by `make shell-test`.
 
 #![no_std]
 #![no_main]
@@ -58,6 +59,29 @@ fn orphan() -> bool {
     process::wait(Some(child)).is_ok()
 }
 
+/// Overflow the kernel log and check `/proc/dmesg` is still whole lines.
+fn log_wraps() -> bool {
+    use basicos_sdk::sys::{self, nr};
+    // A multi-byte character too, so the oldest line can be cut inside one.
+    let line = "isotest log filler — padding to fill the kernel log ring buffer";
+    for _ in 0..400 {
+        unsafe { sys::syscall2(nr::KLOG, line.as_ptr() as usize, line.len()) };
+    }
+    let log = match fs::read_to_string("C:/proc/dmesg") {
+        Ok(log) => log,
+        Err(e) => {
+            println!("isotest: dmesg: {}", e);
+            return false;
+        }
+    };
+    let whole = log.lines().all(|l| l.starts_with('['));
+    let newest = log.lines().last().is_some_and(|l| l.ends_with("kernel log ring buffer"));
+    let wrapped = !log.contains("basicos booted!");
+    let writable = fs::write("C:/proc/dmesg", b"x").is_ok();
+    println!("isotest: log wrap: whole={} newest={} wrapped={} writable={}", whole, newest, wrapped, writable);
+    whole && newest && wrapped && !writable
+}
+
 fn main(_args: Args) -> i32 {
     let mut ok = true;
     ok &= must_fault("read NULL", || read_at(0));
@@ -76,6 +100,7 @@ fn main(_args: Args) -> i32 {
     println!("isotest: exec of a non-ELF returned: {}", err);
 
     ok &= orphan();
+    ok &= log_wraps();
     time::sleep(Duration::from_millis(300));
 
     if ok {

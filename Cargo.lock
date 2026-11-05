@@ -66,6 +66,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dmesg"
+version = "0.1.0"
+dependencies = [
+ "basicos-sdk",
+]
+
+[[package]]
 name = "drives"
 version = "0.1.0"
 dependencies = [

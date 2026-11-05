@@ -27,7 +27,7 @@ def wait_screen(want, what, timeout=10):
 try:
     if not guest.wait_for("C:/> ", 30):
         failures.append("no prompt on serial")
-    wait_screen(r"C:/>\Z", "prompt on screen")
+    wait_screen(r"(?m)^C:/>$", "prompt on screen")
     time.sleep(0.5)  # let the post-boot log messages arrive
 
     # After boot, routine kernel messages stay off the screen...
